@@ -1,43 +1,237 @@
+import Darwin
 import Foundation
 
+public enum FastJSONL {
+    public struct FileStatKey: Equatable, Sendable {
+        public var mtimeSec: Int
+        public var mtimeNsec: Int
+        public var size: Int
+    }
+
+    public static func statKey(atPath path: String) -> FileStatKey? {
+        var st = Darwin.stat()
+        guard stat(path, &st) == 0 else { return nil }
+        return FileStatKey(
+            mtimeSec: st.st_mtimespec.tv_sec,
+            mtimeNsec: st.st_mtimespec.tv_nsec,
+            size: Int(st.st_size)
+        )
+    }
+
+    static func forEachJSONObject(in data: Data, _ body: ([String: Any]) -> Void) {
+        guard !data.isEmpty else { return }
+        data.withUnsafeBytes { rawBuf in
+            guard let base = rawBuf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            let count = rawBuf.count
+            var cursor = 0
+            while cursor < count {
+                autoreleasepool {
+                    var processedInBatch = 0
+                    while cursor < count && processedInBatch < 64 {
+                        let remaining = count - cursor
+                        let nlPtr = memchr(base + cursor, 0x0A, remaining)
+                        let lineEnd: Int
+                        if let nlPtr {
+                            lineEnd = UnsafeRawPointer(nlPtr).assumingMemoryBound(to: UInt8.self) - base
+                        } else {
+                            lineEnd = count
+                        }
+                        var start = cursor
+                        var end = lineEnd
+                        cursor = lineEnd + 1
+
+                        while start < end && base[start] <= 0x20 { start += 1 }
+                        while end > start && base[end - 1] <= 0x20 { end -= 1 }
+                        guard end - start >= 2, base[start] == 0x7B, base[end - 1] == 0x7D else {
+                            continue
+                        }
+                        processedInBatch += 1
+                        let sliceData = Data(
+                            bytesNoCopy: UnsafeMutableRawPointer(mutating: base + start),
+                            count: end - start,
+                            deallocator: .none
+                        )
+                        if let obj = (try? JSONSerialization.jsonObject(with: sliceData)) as? [String: Any] {
+                            body(obj)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 public enum ClaudeCodeAdapter {
+    private struct ParsedTranscriptCore {
+        var baseSession: AgentSession
+        var maxEventDate: Date?
+        var firstEventDate: Date?
+        var lastEventKind: String
+        var lastStopReason: String?
+        var hasAssistantText: Bool
+
+        func materialize(
+            effectiveModificationDate: Date,
+            seenAtByID: [String: TimeInterval],
+            now: Date
+        ) -> AgentSession {
+            var session = baseSession
+            let lastActivityAt: Date
+            if let maxEventDate, maxEventDate > effectiveModificationDate {
+                lastActivityAt = maxEventDate
+            } else {
+                lastActivityAt = effectiveModificationDate
+            }
+            session.lastActivityAt = lastActivityAt
+            if firstEventDate == nil {
+                session.startedAt = effectiveModificationDate
+            }
+            let seenBaseline = session.lastGeneratedAt ?? lastActivityAt
+            let isSeen = SeenSessionLookup.isSeen(
+                sessionID: session.id,
+                lastActivityAt: seenBaseline,
+                seenAtByID: seenAtByID
+            )
+            let ageSeconds = now.timeIntervalSince(lastActivityAt)
+
+            let status: SessionStatus
+            var statusInferred = false
+            if session.errorBanner != nil && ageSeconds < 7200 {
+                status = .failed
+            } else if session.currentTool != nil && ageSeconds < 1800 {
+                status = .runningTool
+                statusInferred = ageSeconds > 8 && ageSeconds < 300
+            } else if (lastEventKind == "api_request"
+                || lastEventKind == "user_prompt"
+                || lastEventKind == "tool_result"
+                || lastStopReason == "tool_use"
+                || lastStopReason == nil) && ageSeconds < 600 {
+                status = .generating
+            } else if !isSeen && ageSeconds < 1800 && hasAssistantText {
+                status = .completed
+            } else {
+                status = .waitingForInput
+            }
+            session.isSeen = isSeen
+            session.status = status
+            session.statusIsInferred = statusInferred
+            return session
+        }
+    }
+
     private struct CachedTranscriptEntry {
-        var mtime: TimeInterval
-        var fileSize: Int
+        var stat: FastJSONL.FileStatKey
         var dayCutoff: TimeInterval
+        var provider: String
         var includeSubagents: Bool
-        var session: AgentSession?
+        var core: ParsedTranscriptCore?
     }
 
     private static let transcriptCacheLock = NSLock()
     nonisolated(unsafe) private static var transcriptCache: [String: CachedTranscriptEntry] = [:]
+    nonisolated(unsafe) private static var providerCache: [String: (stat: FastJSONL.FileStatKey?, value: String)] = [:]
 
     private static let fractionalISOStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     private static let basicISOStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: false)
 
     public static func parseISODate(_ raw: String?) -> Date? {
         guard let raw, !raw.isEmpty else { return nil }
+        if let fast = parseFastUTCISODate(raw) {
+            return fast
+        }
         return (try? fractionalISOStyle.parse(raw)) ?? (try? basicISOStyle.parse(raw))
+    }
+
+    private static func parseFastUTCISODate(_ raw: String) -> Date? {
+        var rawCopy = raw
+        return rawCopy.withUTF8 { buf -> Date? in
+            let n = buf.count
+            // Minimum "YYYY-MM-DDTHH:MM:SSZ" = 20 bytes
+            guard n >= 20,
+                  buf[n - 1] == 0x5A || buf[n - 1] == 0x7A, // 'Z' or 'z'
+                  buf[4] == 0x2D, buf[7] == 0x2D,
+                  (buf[10] == 0x54 || buf[10] == 0x74 || buf[10] == 0x20),
+                  buf[13] == 0x3A, buf[16] == 0x3A else {
+                return nil
+            }
+            @inline(__always)
+            func digit(_ idx: Int) -> Int? {
+                let b = buf[idx]
+                return (b >= 0x30 && b <= 0x39) ? Int(b - 0x30) : nil
+            }
+            @inline(__always)
+            func twoDigits(_ idx: Int) -> Int? {
+                guard let d1 = digit(idx), let d2 = digit(idx + 1) else { return nil }
+                return d1 * 10 + d2
+            }
+            guard let c1 = twoDigits(0), let c2 = twoDigits(2),
+                  let month = twoDigits(5), month >= 1, month <= 12,
+                  let day = twoDigits(8), day >= 1, day <= 31,
+                  let hour = twoDigits(11), hour <= 23,
+                  let minute = twoDigits(14), minute <= 59,
+                  let second = twoDigits(17), second <= 60 else {
+                return nil
+            }
+            var fracSeconds = 0.0
+            if n > 20 {
+                guard buf[19] == 0x2E else { return nil } // '.'
+                var scale = 0.1
+                var i = 20
+                guard i < n - 1 else { return nil }
+                while i < n - 1 {
+                    guard let d = digit(i) else { return nil }
+                    fracSeconds += Double(d) * scale
+                    scale *= 0.1
+                    i += 1
+                }
+            }
+            let year = c1 * 100 + c2
+            var y = year
+            if month <= 2 { y -= 1 }
+            let era = (y >= 0 ? y : y - 399) / 400
+            let yoe = y - era * 400
+            let doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1
+            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+            let days = era * 146097 + doe - 719468
+            let totalSec = Double(days * 86_400 + hour * 3600 + minute * 60 + second) + fracSeconds
+            return Date(timeIntervalSince1970: totalSec)
+        }
     }
 
     public static func detectLocalProvider(homeDirectory: String = NSHomeDirectory()) -> String {
         let path = (homeDirectory as NSString).appendingPathComponent(".claude/settings.json")
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let env = obj["env"] as? [String: Any] else {
+        let curStat = FastJSONL.statKey(atPath: path)
+        transcriptCacheLock.lock()
+        if let cached = providerCache[path], cached.stat == curStat {
+            transcriptCacheLock.unlock()
+            return cached.value
+        }
+        transcriptCacheLock.unlock()
+
+        let resolved: String = {
+            guard curStat != nil,
+                  let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let env = obj["env"] as? [String: Any] else {
+                return "Anthropic"
+            }
+            if env["CLAUDE_CODE_USE_BEDROCK"] != nil {
+                return "AWS Bedrock"
+            }
+            if env["CLAUDE_CODE_USE_VERTEX"] != nil {
+                return "Vertex AI"
+            }
+            if let baseURL = env["ANTHROPIC_BASE_URL"] as? String,
+               let host = URL(string: baseURL)?.host {
+                return FormattingHelpers.providerDisplay(from: host) ?? host
+            }
             return "Anthropic"
-        }
-        if env["CLAUDE_CODE_USE_BEDROCK"] != nil {
-            return "AWS Bedrock"
-        }
-        if env["CLAUDE_CODE_USE_VERTEX"] != nil {
-            return "Vertex AI"
-        }
-        if let baseURL = env["ANTHROPIC_BASE_URL"] as? String,
-           let host = URL(string: baseURL)?.host {
-            return FormattingHelpers.providerDisplay(from: host) ?? host
-        }
-        return "Anthropic"
+        }()
+
+        transcriptCacheLock.lock()
+        providerCache[path] = (curStat, resolved)
+        transcriptCacheLock.unlock()
+        return resolved
     }
 
     public static func loadLocalSessions(
@@ -82,48 +276,16 @@ public enum ClaudeCodeAdapter {
         let dayCutoffTS = dayCutoff.timeIntervalSince1970
 
         for item in collected.mainFiles.prefix(maxCandidateScan) {
-            let fileAge = now.timeIntervalSince(item.mtime)
-            let filePath = item.url.path
-            let fileSize = (try? item.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-            let mtimeTS = item.mtime.timeIntervalSince1970
-            let rawID = item.url.deletingPathExtension().lastPathComponent
-            let parsedOpt: AgentSession?
-            if fileAge > 1800,
-               let cached = lookupCachedTranscript(
-                   path: filePath,
-                   mtime: mtimeTS,
-                   size: fileSize,
-                   dayCutoff: dayCutoffTS,
-                   includeSubagents: includeSubagents
-               ) {
-                parsedOpt = cached
-            } else {
-                guard let content = try? String(contentsOf: item.url, encoding: .utf8) else { continue }
-                let fresh = parseTranscript(
-                    jsonl: content,
-                    fallbackSessionID: rawID,
-                    filePath: filePath,
-                    fileModificationDate: item.mtime,
-                    host: .local,
-                    defaultProvider: provider,
-                    includeSubagents: includeSubagents,
-                    seenAtByID: seenAtByID,
-                    dayCutoff: dayCutoff
-                )
-                if fileAge > 1800 {
-                    storeCachedTranscript(
-                        path: filePath,
-                        mtime: mtimeTS,
-                        size: fileSize,
-                        dayCutoff: dayCutoffTS,
-                        includeSubagents: includeSubagents,
-                        session: fresh
-                    )
-                }
-                parsedOpt = fresh
-            }
-
-            if var session = parsedOpt {
+            if var session = loadOrParseLocalTranscript(
+                url: item.url,
+                effectiveModificationDate: item.mtime,
+                provider: provider,
+                includeSubagents: includeSubagents,
+                seenAtByID: seenAtByID,
+                dayCutoff: dayCutoff,
+                dayCutoffTS: dayCutoffTS,
+                now: now
+            ) {
                 if !acceptedIDs.contains(session.id) {
                     guard acceptedIDs.count < maxUniqueSessions || item.mtime >= dayCutoff else { continue }
                     acceptedIDs.insert(session.id)
@@ -139,18 +301,15 @@ public enum ClaudeCodeAdapter {
                 guard let subItems = subsByParent[deduped[idx].rawSessionID] else { continue }
                 var subParsed: [AgentSession] = []
                 for subItem in subItems {
-                    guard let content = try? String(contentsOf: subItem.url, encoding: .utf8) else { continue }
-                    let fallbackID = subItem.url.deletingPathExtension().lastPathComponent
-                    if let subSession = parseTranscript(
-                        jsonl: content,
-                        fallbackSessionID: fallbackID,
-                        filePath: subItem.url.path,
-                        fileModificationDate: subItem.mtime,
-                        host: .local,
-                        defaultProvider: provider,
+                    if let subSession = loadOrParseLocalTranscript(
+                        url: subItem.url,
+                        effectiveModificationDate: subItem.mtime,
+                        provider: provider,
                         includeSubagents: true,
                         seenAtByID: seenAtByID,
-                        dayCutoff: dayCutoff
+                        dayCutoff: dayCutoff,
+                        dayCutoffTS: dayCutoffTS,
+                        now: now
                     ) {
                         subParsed.append(subSession)
                     }
@@ -163,44 +322,98 @@ public enum ClaudeCodeAdapter {
         return deduped
     }
 
+    private static func loadOrParseLocalTranscript(
+        url: URL,
+        effectiveModificationDate: Date,
+        provider: String,
+        includeSubagents: Bool,
+        seenAtByID: [String: TimeInterval],
+        dayCutoff: Date,
+        dayCutoffTS: TimeInterval,
+        now: Date
+    ) -> AgentSession? {
+        let filePath = url.path
+        guard let stat = FastJSONL.statKey(atPath: filePath) else { return nil }
+        let coreOpt: ParsedTranscriptCore?
+        if let cached = lookupCachedTranscript(
+            path: filePath,
+            stat: stat,
+            dayCutoff: dayCutoffTS,
+            provider: provider,
+            includeSubagents: includeSubagents
+        ) {
+            coreOpt = cached
+        } else {
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+            let diskDate = Date(
+                timeIntervalSince1970: Double(stat.mtimeSec) + Double(stat.mtimeNsec) / 1_000_000_000.0
+            )
+            let rawID = url.deletingPathExtension().lastPathComponent
+            let fresh = parseTranscriptCore(
+                data: data,
+                fallbackSessionID: rawID,
+                filePath: filePath,
+                fileModificationDate: diskDate,
+                host: .local,
+                defaultProvider: provider,
+                includeSubagents: includeSubagents,
+                dayCutoff: dayCutoff
+            )
+            storeCachedTranscript(
+                path: filePath,
+                stat: stat,
+                dayCutoff: dayCutoffTS,
+                provider: provider,
+                includeSubagents: includeSubagents,
+                core: fresh
+            )
+            coreOpt = fresh
+        }
+        return coreOpt?.materialize(
+            effectiveModificationDate: effectiveModificationDate,
+            seenAtByID: seenAtByID,
+            now: now
+        )
+    }
+
     private static func lookupCachedTranscript(
         path: String,
-        mtime: TimeInterval,
-        size: Int,
+        stat: FastJSONL.FileStatKey,
         dayCutoff: TimeInterval,
+        provider: String,
         includeSubagents: Bool
-    ) -> AgentSession?? {
+    ) -> ParsedTranscriptCore?? {
         transcriptCacheLock.lock()
         defer { transcriptCacheLock.unlock() }
         guard let entry = transcriptCache[path],
-              entry.mtime == mtime,
-              entry.fileSize == size,
+              entry.stat == stat,
               entry.dayCutoff == dayCutoff,
+              entry.provider == provider,
               entry.includeSubagents == includeSubagents else {
             return nil
         }
-        return entry.session
+        return entry.core
     }
 
     private static func storeCachedTranscript(
         path: String,
-        mtime: TimeInterval,
-        size: Int,
+        stat: FastJSONL.FileStatKey,
         dayCutoff: TimeInterval,
+        provider: String,
         includeSubagents: Bool,
-        session: AgentSession?
+        core: ParsedTranscriptCore?
     ) {
         transcriptCacheLock.lock()
         defer { transcriptCacheLock.unlock() }
-        if transcriptCache.count > 3000 {
+        if transcriptCache.count > 4000 {
             transcriptCache.removeAll(keepingCapacity: true)
         }
         transcriptCache[path] = CachedTranscriptEntry(
-            mtime: mtime,
-            fileSize: size,
+            stat: stat,
             dayCutoff: dayCutoff,
+            provider: provider,
             includeSubagents: includeSubagents,
-            session: session
+            core: core
         )
     }
 
@@ -306,6 +519,33 @@ public enum ClaudeCodeAdapter {
         seenAtByID: [String: TimeInterval] = [:],
         dayCutoff: Date = Calendar.current.startOfDay(for: Date())
     ) -> AgentSession? {
+        let data = Data(jsonl.utf8)
+        return parseTranscriptCore(
+            data: data,
+            fallbackSessionID: fallbackSessionID,
+            filePath: filePath,
+            fileModificationDate: fileModificationDate,
+            host: host,
+            defaultProvider: defaultProvider,
+            includeSubagents: includeSubagents,
+            dayCutoff: dayCutoff
+        )?.materialize(
+            effectiveModificationDate: fileModificationDate,
+            seenAtByID: seenAtByID,
+            now: Date()
+        )
+    }
+
+    private static func parseTranscriptCore(
+        data: Data,
+        fallbackSessionID: String,
+        filePath: String?,
+        fileModificationDate: Date,
+        host: HostID,
+        defaultProvider: String,
+        includeSubagents: Bool,
+        dayCutoff: Date
+    ) -> ParsedTranscriptCore? {
         struct MessageUsageEntry {
             var usage: TokenUsage
             var model: String?
@@ -338,15 +578,12 @@ public enum ClaudeCodeAdapter {
         var errorBanner: String?
         var sawIDEMarker = false
         var startedAt: Date?
+        var maxEventDate: Date?
         var lastActivityAt = fileModificationDate
         var lastGeneratedAt: Date?
         var lastEntrypoint: String?
 
-        for lineSub in jsonl.split(whereSeparator: \.isNewline) {
-            guard let data = lineSub.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                continue
-            }
+        FastJSONL.forEachJSONObject(in: data) { obj in
             if let sid = obj["sessionId"] as? String, !sid.isEmpty {
                 rawSessionID = sid
             }
@@ -384,6 +621,9 @@ public enum ClaudeCodeAdapter {
             let eventDate = parseISODate(obj["timestamp"] as? String)
             if let eventDate {
                 if startedAt == nil { startedAt = eventDate }
+                if maxEventDate == nil || eventDate > maxEventDate! {
+                    maxEventDate = eventDate
+                }
                 if eventDate > lastActivityAt { lastActivityAt = eventDate }
             }
 
@@ -403,7 +643,7 @@ public enum ClaudeCodeAdapter {
                 lastEventKind = "api_request"
                 lastStopReason = nil
             case "user":
-                guard let msg = obj["message"] as? [String: Any] else { continue }
+                guard let msg = obj["message"] as? [String: Any] else { return }
                 if let text = msg["content"] as? String {
                     let cleaned = cleanUserPrompt(text)
                     if !cleaned.isEmpty {
@@ -447,7 +687,7 @@ public enum ClaudeCodeAdapter {
                     }
                 }
             case "assistant":
-                guard let msg = obj["message"] as? [String: Any] else { continue }
+                guard let msg = obj["message"] as? [String: Any] else { return }
                 var msgModel: String?
                 if let m = msg["model"] as? String, !m.isEmpty, m != "<synthetic>" {
                     model = m
@@ -593,35 +833,6 @@ public enum ClaudeCodeAdapter {
         } else {
             sessionID = "\(host.storageKey):claude:\(rawSessionID)"
         }
-        let isSeen = SeenSessionLookup.isSeen(
-            sessionID: sessionID,
-            lastActivityAt: lastGeneratedAt ?? lastActivityAt,
-            seenAtByID: seenAtByID
-        )
-        let ageSeconds = Date().timeIntervalSince(lastActivityAt)
-
-        let status: SessionStatus
-        var statusInferred = false
-        if errorBanner != nil && ageSeconds < 7200 {
-            status = .failed
-        } else if currentTool != nil && ageSeconds < 1800 {
-            if ageSeconds > 8 && ageSeconds < 300 {
-                status = .runningTool
-                statusInferred = true
-            } else {
-                status = .runningTool
-            }
-        } else if (lastEventKind == "api_request"
-            || lastEventKind == "user_prompt"
-            || lastEventKind == "tool_result"
-            || lastStopReason == "tool_use"
-            || lastStopReason == nil) && ageSeconds < 600 {
-            status = .generating
-        } else if !isSeen && ageSeconds < 1800 && lastAssistantText != nil {
-            status = .completed
-        } else {
-            status = .waitingForInput
-        }
 
         let overview: String
         if let err = errorBanner {
@@ -647,15 +858,15 @@ public enum ClaudeCodeAdapter {
         } else {
             resolvedProvider = defaultProvider
         }
-        return AgentSession(
+        let baseSession = AgentSession(
             id: sessionID,
             rawSessionID: rawSessionID,
             kind: .claudeCode,
             host: host,
             title: finalTitle,
             overview: overview,
-            status: status,
-            statusIsInferred: statusInferred,
+            status: .waitingForInput,
+            statusIsInferred: false,
             cwd: cwd,
             groupDirectory: cwd,
             provider: resolvedProvider,
@@ -678,8 +889,16 @@ public enum ClaudeCodeAdapter {
             launchEnvironment: (sawIDEMarker || lastEntrypoint?.contains("vscode") == true) ? .vscodeExtension : .terminalCLI,
             startedAt: startedAt ?? fileModificationDate,
             lastActivityAt: lastActivityAt,
-            isSeen: isSeen,
+            isSeen: false,
             lastGeneratedAt: lastGeneratedAt
+        )
+        return ParsedTranscriptCore(
+            baseSession: baseSession,
+            maxEventDate: maxEventDate,
+            firstEventDate: startedAt,
+            lastEventKind: lastEventKind,
+            lastStopReason: lastStopReason,
+            hasAssistantText: lastAssistantText != nil
         )
     }
 
@@ -696,22 +915,33 @@ public enum ClaudeCodeAdapter {
 
     public static func summarizeToolInput(name: String, input: Any?) -> String {
         if let dict = input as? [String: Any] {
-            for key in ["command", "cmd", "file_path", "path", "pattern", "query", "url", "description"] {
+            for key in ["command", "cmd", "file_path", "path", "pattern", "query", "url", "description", "skill", "notebook_path", "prompt"] {
                 if let val = dict[key] as? String, !val.isEmpty {
                     return firstSingleLine(val, maxLength: 72)
                 }
             }
-            if let data = try? JSONSerialization.data(withJSONObject: dict),
-               let s = String(data: data, encoding: .utf8) {
+            // Avoid serializing huge multi-KB tool payloads (e.g. file contents) just for a 72-char preview
+            for (k, v) in dict {
+                if let s = v as? String, !s.isEmpty {
+                    return firstSingleLine("\(k): \(firstSingleLine(s, maxLength: 60))", maxLength: 72)
+                }
+            }
+            if dict.count <= 8,
+               let data = try? JSONSerialization.data(withJSONObject: dict),
+               let s = String(data: data.prefix(256), encoding: .utf8) {
                 return firstSingleLine(s, maxLength: 72)
             }
         } else if let str = input as? String, !str.isEmpty {
-            if let data = str.data(using: .utf8),
-               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                return summarizeToolInput(name: name, input: dict)
-            }
-            if str.hasPrefix("*** Begin Patch") {
-                let fileLine = str.split(whereSeparator: \.isNewline).first {
+            let firstNonWS = str.utf8.first { $0 > 0x20 }
+            if firstNonWS == 0x7B { // '{'
+                if str.utf8.count <= 32_768,
+                   let data = str.data(using: .utf8),
+                   let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    return summarizeToolInput(name: name, input: dict)
+                }
+            } else if str.hasPrefix("*** Begin Patch") {
+                let prefixText = str.utf8.count > 1024 ? String(decoding: str.utf8.prefix(1024), as: UTF8.self) : str
+                let fileLine = prefixText.split(whereSeparator: \.isNewline).first {
                     $0.hasPrefix("*** Update File:") || $0.hasPrefix("*** Add File:") || $0.hasPrefix("*** Delete File:")
                 }
                 if let fileLine {
@@ -728,11 +958,62 @@ public enum ClaudeCodeAdapter {
     }
 
     public static func firstSingleLine(_ text: String, maxLength: Int) -> String {
-        let single = text
-            .replacingOccurrences(of: "\r", with: " ")
-            .split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .first { !$0.isEmpty && !$0.hasPrefix("```") } ?? text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return "" }
+        let scalars = text.unicodeScalars
+        let maxTotalScalars = max(2048, maxLength * 16)
+        let maxLineScalars = max(256, maxLength * 3)
+        var cursor = scalars.startIndex
+        var scannedScalars = 0
+        var chosenLine: String?
+
+        while cursor < scalars.endIndex && scannedScalars < maxTotalScalars {
+            // Skip leading whitespace / newlines
+            while cursor < scalars.endIndex && scannedScalars < maxTotalScalars {
+                let v = scalars[cursor].value
+                if v == 0x0A || v == 0x0D || v == 0x20 || v == 0x09 || scalars[cursor].properties.isWhitespace {
+                    cursor = scalars.index(after: cursor)
+                    scannedScalars += 1
+                } else {
+                    break
+                }
+            }
+            guard cursor < scalars.endIndex && scannedScalars < maxTotalScalars else { break }
+
+            let lineStart = cursor
+            var lineScalarCount = 0
+            var lineKeepEnd = cursor
+            while cursor < scalars.endIndex && scannedScalars < maxTotalScalars {
+                let v = scalars[cursor].value
+                if v == 0x0A || v == 0x0D || v == 0x2028 || v == 0x2029 {
+                    break
+                }
+                cursor = scalars.index(after: cursor)
+                scannedScalars += 1
+                if lineScalarCount < maxLineScalars {
+                    lineScalarCount += 1
+                    lineKeepEnd = cursor
+                }
+            }
+
+            let rawLine = String(String.UnicodeScalarView(scalars[lineStart..<lineKeepEnd]))
+                .trimmingCharacters(in: .whitespaces)
+            if !rawLine.isEmpty && !rawLine.hasPrefix("```") {
+                chosenLine = rawLine
+                break
+            }
+        }
+
+        let single: String
+        if let chosenLine {
+            single = chosenLine
+        } else {
+            let capEnd = scalars.index(scalars.startIndex, offsetBy: maxLineScalars, limitedBy: scalars.endIndex) ?? scalars.endIndex
+            single = String(String.UnicodeScalarView(scalars[scalars.startIndex..<capEnd]))
+                .replacingOccurrences(of: "\r", with: " ")
+                .replacingOccurrences(of: "\n", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
         let stripped = single
             .replacingOccurrences(of: "**", with: "")
             .replacingOccurrences(of: "## ", with: "")

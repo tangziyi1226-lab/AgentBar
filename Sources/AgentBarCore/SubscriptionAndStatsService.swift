@@ -99,6 +99,24 @@ public struct TotalAnalyticsSnapshot: Sendable {
 }
 
 public enum SubscriptionAndStatsService {
+    private struct CodexAuthInfo {
+        var planBadge: String?
+        var activeUntilText: String?
+    }
+
+    private struct ClaudeConfigInfo {
+        var planBadge: String?
+        var endpointHost: String?
+        var configuredModel: String?
+    }
+
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var codexAuthCache: [String: (stat: FastJSONL.FileStatKey?, info: CodexAuthInfo)] = [:]
+    nonisolated(unsafe) private static var claudeConfigCache: [String: (s1: FastJSONL.FileStatKey?, s2: FastJSONL.FileStatKey?, info: ClaudeConfigInfo)] = [:]
+    nonisolated(unsafe) private static var rateLimitFileCache: [String: (stat: FastJSONL.FileStatKey, quotas: [QuotaWindowReading])] = [:]
+    nonisolated(unsafe) private static var fallbackDirScanCache: [String: (checkedAt: TimeInterval, quotas: [QuotaWindowReading])] = [:]
+    private static let rateLimitsNeedle = Data("\"rate_limits\"".utf8)
+
     public static func detectLocalSubscriptions(
         homeDirectory: String = NSHomeDirectory(),
         sessions: [AgentSession],
@@ -113,7 +131,12 @@ public enum SubscriptionAndStatsService {
         }
         var items: [SubscriptionCardItem] = []
 
-        if let codexCard = detectCodexSubscription(homeDirectory: homeDirectory, todaySessions: todaySessions, dayCutoff: dayCutoff) {
+        if let codexCard = detectCodexSubscription(
+            homeDirectory: homeDirectory,
+            allSessions: uniqueSessions,
+            todaySessions: todaySessions,
+            dayCutoff: dayCutoff
+        ) {
             items.append(codexCard)
         }
         if let claudeCard = detectClaudeSubscription(homeDirectory: homeDirectory, todaySessions: todaySessions, dayCutoff: dayCutoff) {
@@ -153,34 +176,52 @@ public enum SubscriptionAndStatsService {
         )
     }
 
-    private static func detectCodexSubscription(
-        homeDirectory: String,
-        todaySessions: [AgentSession],
-        dayCutoff: Date
-    ) -> SubscriptionCardItem? {
+    private static func loadCachedCodexAuth(homeDirectory: String) -> CodexAuthInfo {
         let authPath = (homeDirectory as NSString).appendingPathComponent(".codex/auth.json")
-        var planBadge: String?
-        var activeUntilText: String?
+        let curStat = FastJSONL.statKey(atPath: authPath)
+        cacheLock.lock()
+        if let cached = codexAuthCache[authPath], cached.stat == curStat {
+            cacheLock.unlock()
+            return cached.info
+        }
+        cacheLock.unlock()
 
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
+        var info = CodexAuthInfo()
+        if curStat != nil,
+           let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             if let tokens = obj["tokens"] as? [String: Any],
                let idToken = tokens["id_token"] as? String,
                let claims = decodeJWTPayload(idToken) {
                 let oa = claims["https://api.openai.com/auth"] as? [String: Any]
                 if let rawPlan = (oa?["chatgpt_plan_type"] as? String)?.lowercased(), !rawPlan.isEmpty {
-                    planBadge = formatChatGPTPlan(rawPlan)
+                    info.planBadge = formatChatGPTPlan(rawPlan)
                 }
                 if let untilStr = oa?["chatgpt_subscription_active_until"] as? String {
-                    activeUntilText = formatShortRenewal(untilStr)
+                    info.activeUntilText = formatShortRenewal(untilStr)
                 }
             }
-            if planBadge == nil, let apiKey = obj["OPENAI_API_KEY"] as? String, !apiKey.isEmpty {
-                planBadge = "API Key"
+            if info.planBadge == nil, let apiKey = obj["OPENAI_API_KEY"] as? String, !apiKey.isEmpty {
+                info.planBadge = "API Key"
             }
         }
+        cacheLock.lock()
+        codexAuthCache[authPath] = (curStat, info)
+        cacheLock.unlock()
+        return info
+    }
 
-        let quotas = readLatestCodexRateLimits(homeDirectory: homeDirectory)
+    private static func detectCodexSubscription(
+        homeDirectory: String,
+        allSessions: [AgentSession],
+        todaySessions: [AgentSession],
+        dayCutoff: Date
+    ) -> SubscriptionCardItem? {
+        let auth = loadCachedCodexAuth(homeDirectory: homeDirectory)
+        let planBadge = auth.planBadge
+        let activeUntilText = auth.activeUntilText
+
+        let quotas = readLatestCodexRateLimits(homeDirectory: homeDirectory, sessions: allSessions)
         let codexTodayTokens = todaySessions
             .filter { $0.kind == .codexDesktop || $0.kind == .codexCLI }
             .reduce(0) { $0 + $1.effectiveTodayUsage(dayCutoff: dayCutoff).totalTokens }
@@ -212,52 +253,175 @@ public enum SubscriptionAndStatsService {
         )
     }
 
-    private static func readLatestCodexRateLimits(homeDirectory: String) -> [QuotaWindowReading] {
-        let sessionsRoot = (homeDirectory as NSString).appendingPathComponent(".codex/sessions")
-        let cutoff = Date().addingTimeInterval(-7 * 24 * 3600)
-        let recentFiles = ClaudeCodeAdapter.collectRecentJSONLFiles(rootPath: sessionsRoot, cutoff: cutoff)
+    private static func readRateLimitsFromFile(path: String) -> [QuotaWindowReading] {
+        guard let stat = FastJSONL.statKey(atPath: path) else { return [] }
+        cacheLock.lock()
+        if let hit = rateLimitFileCache[path], hit.stat == stat {
+            cacheLock.unlock()
+            return hit.quotas
+        }
+        cacheLock.unlock()
 
-        for file in recentFiles.prefix(20) {
-            guard let data = try? Data(contentsOf: file.url, options: .mappedIfSafe) else { continue }
-            let slice = data.suffix(120_000)
-            let tailText = String(decoding: slice, as: UTF8.self)
-            for line in tailText.split(whereSeparator: \.isNewline).reversed() {
-                guard line.contains("\"rate_limits\""),
-                      let lineData = String(line).data(using: .utf8),
-                      let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                      let payload = obj["payload"] as? [String: Any],
-                      let rl = payload["rate_limits"] as? [String: Any] else {
-                    continue
-                }
-                var windows: [QuotaWindowReading] = []
-                if let primary = rl["primary"] as? [String: Any],
-                   let pct = (primary["used_percent"] as? NSNumber)?.doubleValue {
-                    let mins = (primary["window_minutes"] as? NSNumber)?.intValue ?? 300
-                    let resetTS = (primary["resets_at"] as? NSNumber)?.doubleValue
-                    let label = mins == 300 ? "5h 窗口" : "\(max(1, mins / 60))h 窗口"
-                    windows.append(QuotaWindowReading(
-                        label: label,
-                        usedPercent: pct,
-                        resetsAt: resetTS.map { Date(timeIntervalSince1970: $0) }
-                    ))
-                }
-                if let secondary = rl["secondary"] as? [String: Any],
-                   let pct = (secondary["used_percent"] as? NSNumber)?.doubleValue {
-                    let mins = (secondary["window_minutes"] as? NSNumber)?.intValue ?? 10080
-                    let resetTS = (secondary["resets_at"] as? NSNumber)?.doubleValue
-                    let label = mins >= 10000 ? "7d 周额度" : "\(max(1, mins / 60))h 额度"
-                    windows.append(QuotaWindowReading(
-                        label: label,
-                        usedPercent: pct,
-                        resetsAt: resetTS.map { Date(timeIntervalSince1970: $0) }
-                    ))
-                }
-                if !windows.isEmpty {
-                    return windows
-                }
+        let parsed = extractRateLimitsTail(url: URL(fileURLWithPath: path))
+        cacheLock.lock()
+        if rateLimitFileCache.count > 512 {
+            rateLimitFileCache.removeAll(keepingCapacity: true)
+        }
+        rateLimitFileCache[path] = (stat, parsed)
+        cacheLock.unlock()
+        return parsed
+    }
+
+    private static func extractRateLimitsTail(url: URL) -> [QuotaWindowReading] {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe), !data.isEmpty else {
+            return []
+        }
+        let newline: UInt8 = 0x0A
+        let lowerBound = max(0, data.count - 120_000)
+        var searchUpper = data.count
+
+        while searchUpper > lowerBound {
+            guard let hit = data.range(of: rateLimitsNeedle, options: .backwards, in: lowerBound..<searchUpper) else {
+                break
+            }
+            let lineStart: Int
+            if let prevNL = data[lowerBound..<hit.lowerBound].lastIndex(of: newline) {
+                lineStart = prevNL + 1
+            } else {
+                lineStart = lowerBound
+            }
+            let lineEnd = data[hit.upperBound..<data.count].firstIndex(of: newline) ?? data.count
+            searchUpper = lineStart > lowerBound ? (lineStart - 1) : lowerBound
+
+            let lineData = data[lineStart..<lineEnd]
+            guard let obj = (try? JSONSerialization.jsonObject(with: lineData)) as? [String: Any],
+                  let payload = obj["payload"] as? [String: Any],
+                  let rl = payload["rate_limits"] as? [String: Any] else {
+                continue
+            }
+            var windows: [QuotaWindowReading] = []
+            if let primary = rl["primary"] as? [String: Any],
+               let pct = (primary["used_percent"] as? NSNumber)?.doubleValue {
+                let mins = (primary["window_minutes"] as? NSNumber)?.intValue ?? 300
+                let resetTS = (primary["resets_at"] as? NSNumber)?.doubleValue
+                let label = mins == 300 ? "5h 窗口" : "\(max(1, mins / 60))h 窗口"
+                windows.append(QuotaWindowReading(
+                    label: label,
+                    usedPercent: pct,
+                    resetsAt: resetTS.map { Date(timeIntervalSince1970: $0) }
+                ))
+            }
+            if let secondary = rl["secondary"] as? [String: Any],
+               let pct = (secondary["used_percent"] as? NSNumber)?.doubleValue {
+                let mins = (secondary["window_minutes"] as? NSNumber)?.intValue ?? 10080
+                let resetTS = (secondary["resets_at"] as? NSNumber)?.doubleValue
+                let label = mins >= 10000 ? "7d 周额度" : "\(max(1, mins / 60))h 额度"
+                windows.append(QuotaWindowReading(
+                    label: label,
+                    usedPercent: pct,
+                    resetsAt: resetTS.map { Date(timeIntervalSince1970: $0) }
+                ))
+            }
+            if !windows.isEmpty {
+                return windows
             }
         }
         return []
+    }
+
+    private static func readLatestCodexRateLimits(
+        homeDirectory: String,
+        sessions: [AgentSession]
+    ) -> [QuotaWindowReading] {
+        // Fast path: inspect already-known local Codex session files ordered by newest activity
+        let localCodexFiles = sessions
+            .filter { $0.host.isLocal && ($0.kind == .codexDesktop || $0.kind == .codexCLI) }
+            .sorted { $0.lastActivityAt > $1.lastActivityAt }
+            .compactMap(\.sourceFilePath)
+
+        for path in localCodexFiles.prefix(20) {
+            let quotas = readRateLimitsFromFile(path: path)
+            if !quotas.isEmpty {
+                return quotas
+            }
+        }
+
+        // Throttled fallback (every 30s) in case lookbackHours excluded older sessions within the 7-day window
+        let nowTS = Date().timeIntervalSince1970
+        let sessionsRoot = (homeDirectory as NSString).appendingPathComponent(".codex/sessions")
+        cacheLock.lock()
+        if let hit = fallbackDirScanCache[sessionsRoot], nowTS - hit.checkedAt < 30.0 {
+            cacheLock.unlock()
+            return hit.quotas
+        }
+        cacheLock.unlock()
+
+        let cutoff = Date().addingTimeInterval(-7 * 24 * 3600)
+        let recentFiles = ClaudeCodeAdapter.collectRecentJSONLFiles(rootPath: sessionsRoot, cutoff: cutoff)
+        var resolved: [QuotaWindowReading] = []
+        for file in recentFiles.prefix(20) {
+            let quotas = readRateLimitsFromFile(path: file.url.path)
+            if !quotas.isEmpty {
+                resolved = quotas
+                break
+            }
+        }
+
+        cacheLock.lock()
+        fallbackDirScanCache[sessionsRoot] = (nowTS, resolved)
+        cacheLock.unlock()
+        return resolved
+    }
+
+    private static func loadCachedClaudeConfig(homeDirectory: String) -> ClaudeConfigInfo {
+        let claudeJSONPath = (homeDirectory as NSString).appendingPathComponent(".claude.json")
+        let settingsPath = (homeDirectory as NSString).appendingPathComponent(".claude/settings.json")
+        let s1 = FastJSONL.statKey(atPath: claudeJSONPath)
+        let s2 = FastJSONL.statKey(atPath: settingsPath)
+
+        cacheLock.lock()
+        if let cached = claudeConfigCache[homeDirectory], cached.s1 == s1, cached.s2 == s2 {
+            cacheLock.unlock()
+            return cached.info
+        }
+        cacheLock.unlock()
+
+        var info = ClaudeConfigInfo()
+        if s1 != nil,
+           let data = try? Data(contentsOf: URL(fileURLWithPath: claudeJSONPath)),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let oauth = obj["oauthAccount"] as? [String: Any] {
+                if let sub = oauth["subscriptionType"] as? String, !sub.isEmpty {
+                    info.planBadge = "Claude \(sub.capitalized)"
+                } else if let tier = oauth["rateLimitTier"] as? String, !tier.isEmpty {
+                    info.planBadge = tier.contains("max") ? "Claude Max" : "Claude Pro"
+                }
+            }
+            if let m = obj["model"] as? String, !m.isEmpty {
+                info.configuredModel = m
+            }
+        }
+
+        if s2 != nil,
+           let data = try? Data(contentsOf: URL(fileURLWithPath: settingsPath)),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let m = obj["model"] as? String, !m.isEmpty {
+                info.configuredModel = m
+            }
+            if let env = obj["env"] as? [String: Any],
+               let baseURL = env["ANTHROPIC_BASE_URL"] as? String,
+               let host = URL(string: baseURL)?.host {
+                info.endpointHost = host
+                if info.planBadge == nil {
+                    info.planBadge = "API Gateway"
+                }
+            }
+        }
+
+        cacheLock.lock()
+        claudeConfigCache[homeDirectory] = (s1, s2, info)
+        cacheLock.unlock()
+        return info
     }
 
     private static func detectClaudeSubscription(
@@ -265,41 +429,10 @@ public enum SubscriptionAndStatsService {
         todaySessions: [AgentSession],
         dayCutoff: Date
     ) -> SubscriptionCardItem? {
-        let claudeJSONPath = (homeDirectory as NSString).appendingPathComponent(".claude.json")
-        let settingsPath = (homeDirectory as NSString).appendingPathComponent(".claude/settings.json")
-
-        var planBadge: String?
-        var endpointHost: String?
-        var configuredModel: String?
-
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: claudeJSONPath)),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if let oauth = obj["oauthAccount"] as? [String: Any] {
-                if let sub = oauth["subscriptionType"] as? String, !sub.isEmpty {
-                    planBadge = "Claude \(sub.capitalized)"
-                } else if let tier = oauth["rateLimitTier"] as? String, !tier.isEmpty {
-                    planBadge = tier.contains("max") ? "Claude Max" : "Claude Pro"
-                }
-            }
-            if let m = obj["model"] as? String, !m.isEmpty {
-                configuredModel = m
-            }
-        }
-
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: settingsPath)),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if let m = obj["model"] as? String, !m.isEmpty {
-                configuredModel = m
-            }
-            if let env = obj["env"] as? [String: Any],
-               let baseURL = env["ANTHROPIC_BASE_URL"] as? String,
-               let host = URL(string: baseURL)?.host {
-                endpointHost = host
-                if planBadge == nil {
-                    planBadge = "API Gateway"
-                }
-            }
-        }
+        let cfg = loadCachedClaudeConfig(homeDirectory: homeDirectory)
+        let planBadge = cfg.planBadge
+        let endpointHost = cfg.endpointHost
+        let configuredModel = cfg.configuredModel
 
         let claudeTodayTokens = todaySessions
             .filter { $0.kind == .claudeCode || $0.kind == .claudeDesktop }

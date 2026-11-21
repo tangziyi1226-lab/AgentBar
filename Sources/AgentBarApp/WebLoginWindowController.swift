@@ -102,6 +102,20 @@ final class WebBalanceExtractor: NSObject, WKNavigationDelegate {
     private var pollTask: Task<Void, Never>?
     private var watchdogTask: Task<Void, Never>?
 
+    private var loginWindowCloseObserver: NSObjectProtocol?
+
+    private func tearDownHeadlessWebView() {
+        if let wv = headlessWebView {
+            wv.stopLoading()
+            wv.navigationDelegate = nil
+            wv.loadHTMLString("", baseURL: nil)
+        }
+        headlessWebView = nil
+        pollTask = nil
+        watchdogTask?.cancel()
+        watchdogTask = nil
+    }
+
     func openInteractiveLoginWindow(
         urlString: String,
         title: String,
@@ -109,6 +123,9 @@ final class WebBalanceExtractor: NSObject, WKNavigationDelegate {
         onLiveExtract: ((String) -> Void)? = nil
     ) {
         guard let url = URL(string: urlString) else { return }
+        if let oldWin = loginWindow {
+            oldWin.close()
+        }
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 980, height: 680), configuration: config)
@@ -124,12 +141,36 @@ final class WebBalanceExtractor: NSObject, WKNavigationDelegate {
             backing: .buffered,
             defer: false
         )
+        win.isReleasedWhenClosed = false
         win.title = "AgentBar 看板 · \(title)（登录或页面加载后自动同步额度到面板）"
         win.contentView = webView
         win.center()
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         self.loginWindow = win
+
+        if let obs = loginWindowCloseObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
+        loginWindowCloseObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: win,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.interactiveWebView?.stopLoading()
+                self.interactiveWebView?.navigationDelegate = nil
+                self.interactiveWebView = nil
+                self.interactiveOnSync = nil
+                self.loginWindow?.contentView = nil
+                self.loginWindow = nil
+                if let obs = self.loginWindowCloseObserver {
+                    NotificationCenter.default.removeObserver(obs)
+                    self.loginWindowCloseObserver = nil
+                }
+            }
+        }
     }
 
     private static func buildJSExpression(from jsOrSelector: String) -> String {
@@ -172,7 +213,7 @@ final class WebBalanceExtractor: NSObject, WKNavigationDelegate {
                 }
                 guard self.pendingContinuation != nil else { return }
                 self.pendingContinuation = nil
-                self.headlessWebView = nil
+                self.tearDownHeadlessWebView()
                 if !fallback.isEmpty {
                     activeCont.resume(returning: fallback)
                 } else {
@@ -198,10 +239,10 @@ final class WebBalanceExtractor: NSObject, WKNavigationDelegate {
         if webView === interactiveWebView {
             let expr = Self.buildJSExpression(from: interactiveCustomExpr)
             let callback = interactiveOnSync
-            Task { @MainActor in
+            Task { @MainActor [weak self, weak webView] in
                 for delayMs in [900, 2200, 4000] {
                     try? await Task.sleep(for: .milliseconds(delayMs))
-                    guard webView === self.interactiveWebView else { return }
+                    guard let self, let webView, webView === self.interactiveWebView else { return }
                     if let res = try? await webView.evaluateJavaScript(expr) {
                         let str = "\(res)"
                         if !str.contains("\"loading\":true") && !str.contains("\"needsLogin\":true") {
@@ -217,12 +258,12 @@ final class WebBalanceExtractor: NSObject, WKNavigationDelegate {
         let expr = pendingExpression
         let expectedHost = targetHost
         pollTask?.cancel()
-        pollTask = Task { @MainActor in
+        pollTask = Task { @MainActor [weak self, weak webView] in
             var lastString = ""
             for attempt in 0..<8 {
                 try? await Task.sleep(for: .milliseconds(attempt == 0 ? 750 : 650))
                 if Task.isCancelled { return }
-                guard self.pendingContinuation != nil else { return }
+                guard let self, let webView, self.pendingContinuation != nil else { return }
 
                 let currentHost = webView.url?.host?.lowercased()
                 if let res = try? await webView.evaluateJavaScript(expr) {
@@ -242,36 +283,28 @@ final class WebBalanceExtractor: NSObject, WKNavigationDelegate {
                     }
                 }
             }
-            guard let cont = self.pendingContinuation else { return }
+            guard let self, let cont = self.pendingContinuation else { return }
             self.pendingContinuation = nil
-            self.watchdogTask?.cancel()
-            self.watchdogTask = nil
+            self.tearDownHeadlessWebView()
             cont.resume(returning: lastString)
-            self.headlessWebView = nil
         }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         guard webView === headlessWebView else { return }
         pollTask?.cancel()
-        watchdogTask?.cancel()
-        watchdogTask = nil
-        if let cont = pendingContinuation {
-            pendingContinuation = nil
-            cont.resume(throwing: error)
-        }
-        headlessWebView = nil
+        let cont = pendingContinuation
+        pendingContinuation = nil
+        tearDownHeadlessWebView()
+        cont?.resume(throwing: error)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         guard webView === headlessWebView else { return }
         pollTask?.cancel()
-        watchdogTask?.cancel()
-        watchdogTask = nil
-        if let cont = pendingContinuation {
-            pendingContinuation = nil
-            cont.resume(throwing: error)
-        }
-        headlessWebView = nil
+        let cont = pendingContinuation
+        pendingContinuation = nil
+        tearDownHeadlessWebView()
+        cont?.resume(throwing: error)
     }
 }

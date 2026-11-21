@@ -360,14 +360,81 @@ struct AgentBarHookMain {
         precondition(PricingCatalog.rule(for: "openai/gpt-5.3-codex", customRules: PricingCatalog.defaults)?.inputPerMillionUSD == 1.75)
         precondition(PricingCatalog.rule(for: "gateway/glm-53:latest", customRules: PricingCatalog.defaults)?.inputPerMillionUSD == 1.2)
 
+        // Unit tests: active (<1800s) file caching + dynamic seen/status materialization without file mtime change
+        let tmpHome = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("agentbar-cache-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmpHome) }
+        let tmpClaudeDir = tmpHome.appendingPathComponent(".claude/projects/-tmp-proj", isDirectory: true)
+        let tmpSubDir = tmpClaudeDir.appendingPathComponent("c-parent-1/subagents", isDirectory: true)
+        let tmpCodexDir = tmpHome.appendingPathComponent(".codex/sessions/2026/11/21", isDirectory: true)
+        try! FileManager.default.createDirectory(at: tmpSubDir, withIntermediateDirectories: true)
+        try! FileManager.default.createDirectory(at: tmpCodexDir, withIntermediateDirectories: true)
+
+        let tsRecent = isoNow.string(from: now.addingTimeInterval(-12))
+        let parentJSONL = """
+        {"type":"user","sessionId":"c-parent-1","cwd":"/tmp/proj","timestamp":"\(tsRecent)","message":{"role":"user","content":"Check CPU optimization"}}
+        {"type":"assistant","sessionId":"c-parent-1","cwd":"/tmp/proj","timestamp":"\(tsRecent)","message":{"id":"m-p1","role":"assistant","model":"claude-opus-5-5","stop_reason":"end_turn","content":[{"type":"text","text":"Optimization complete!"}],"usage":{"input_tokens":120,"output_tokens":45,"cache_read_input_tokens":500,"cache_creation_input_tokens":0}}}
+        """
+        let cacheSubJSONL = """
+        {"type":"assistant","sessionId":"c-sub-1","cwd":"/tmp/proj","timestamp":"\(tsRecent)","message":{"id":"m-s1","role":"assistant","model":"claude-haiku-5-5","stop_reason":"end_turn","content":[{"type":"text","text":"Subagent done"}],"usage":{"input_tokens":30,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+        """
+        let codexActiveJSONL = """
+        {"timestamp":"\(tsRecent)","type":"session_meta","payload":{"id":"cx-active-1","cwd":"/tmp/proj","originator":"codex_cli_rs","source":"cli"}}
+        {"timestamp":"\(tsRecent)","type":"turn_context","payload":{"model":"gpt-5.3-codex"}}
+        {"timestamp":"\(tsRecent)","type":"event_msg","payload":{"type":"user_message","message":"Benchmark warm cache"}}
+        {"timestamp":"\(tsRecent)","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":80,"total_tokens":580}},"rate_limits":{"primary":{"used_percent":12.5,"window_minutes":300}}}}
+        {"timestamp":"\(tsRecent)","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Warm cache hit verified"}}
+        """
+        try! Data(parentJSONL.utf8).write(to: tmpClaudeDir.appendingPathComponent("c-parent-1.jsonl"))
+        try! Data(cacheSubJSONL.utf8).write(to: tmpSubDir.appendingPathComponent("agent-s1.jsonl"))
+        try! Data(codexActiveJSONL.utf8).write(to: tmpCodexDir.appendingPathComponent("rollout-cx-active-1.jsonl"))
+
+        let coldClaude = await ClaudeCodeAdapter.loadLocalSessions(homeDirectory: tmpHome.path, lookbackHours: 24, seenAtByID: [:])
+        let coldCodex = await CodexAdapter.loadLocalSessions(homeDirectory: tmpHome.path, lookbackHours: 24, seenAtByID: [:])
+        precondition(coldClaude.count == 1 && coldClaude[0].usage.totalTokens == 705) // 665 parent + 40 subagent
+        precondition(coldClaude[0].status == .completed && !coldClaude[0].isSeen)
+        precondition(coldCodex.count == 1 && coldCodex[0].status == .completed && !coldCodex[0].isSeen)
+
+        // Warm poll with updated seenAtByID must transition both to seen/waitingForInput without mtime change
+        let futureSeenTS = now.addingTimeInterval(60).timeIntervalSince1970
+        let cacheSeenMap: [String: TimeInterval] = [
+            coldClaude[0].id: futureSeenTS,
+            coldCodex[0].id: futureSeenTS
+        ]
+        let warmClaude = await ClaudeCodeAdapter.loadLocalSessions(homeDirectory: tmpHome.path, lookbackHours: 24, seenAtByID: cacheSeenMap)
+        let warmCodex = await CodexAdapter.loadLocalSessions(homeDirectory: tmpHome.path, lookbackHours: 24, seenAtByID: cacheSeenMap)
+        precondition(warmClaude.count == 1 && warmClaude[0].isSeen && warmClaude[0].status == .waitingForInput)
+        precondition(warmClaude[0].usage.totalTokens == 705)
+        precondition(warmCodex.count == 1 && warmCodex[0].isSeen && warmCodex[0].status == .waitingForInput)
+        let tmpSubs = SubscriptionAndStatsService.detectLocalSubscriptions(homeDirectory: tmpHome.path, sessions: warmCodex)
+        precondition(tmpSubs.first(where: { $0.id == "sub:codex" })?.quotas.first?.usedPercent == 12.5)
+
+        let scannedProcs = ProcessAndChatScanner.scanLocalAgentProcesses()
+        precondition(scannedProcs.allSatisfy { $0.pid > 0 && !$0.command.isEmpty })
+
+        let tCold0 = ContinuousClock.now
         let realClaude = await ClaudeCodeAdapter.loadLocalSessions(lookbackHours: 168)
         let realCodex = await CodexAdapter.loadLocalSessions(lookbackHours: 168)
         let realDSH = await DeepSeekHarnessAdapter.loadLocalSessions(lookbackHours: 168)
         let realCursor = await CursorTraeAdapter.loadLocalSessions(lookbackHours: 168)
+        let coldSubs = SubscriptionAndStatsService.detectLocalSubscriptions(sessions: realClaude + realCodex + realDSH + realCursor)
+        let coldElapsed = ContinuousClock.now - tCold0
+
+        let tWarm0 = ContinuousClock.now
+        let warmRealClaude = await ClaudeCodeAdapter.loadLocalSessions(lookbackHours: 168)
+        let warmRealCodex = await CodexAdapter.loadLocalSessions(lookbackHours: 168)
+        let warmRealDSH = await DeepSeekHarnessAdapter.loadLocalSessions(lookbackHours: 168)
+        let warmRealCursor = await CursorTraeAdapter.loadLocalSessions(lookbackHours: 168)
+        let warmProcs = ProcessAndChatScanner.scanLocalAgentProcesses()
+        let warmSubs = SubscriptionAndStatsService.detectLocalSubscriptions(sessions: warmRealClaude + warmRealCodex + warmRealDSH + warmRealCursor)
+        let warmElapsed = ContinuousClock.now - tWarm0
+
+        precondition(warmRealClaude.count == realClaude.count && warmRealCodex.count == realCodex.count)
+        precondition(warmSubs == coldSubs)
         let combinedReal = realClaude + realCodex + realDSH + realCursor
         precondition(Set(combinedReal.map(\.id)).count == combinedReal.count, "Duplicate session IDs detected!")
         let sshEntries = SSHProbeService.discoverSSHConfigEntries()
-        print("PASS self-test | local sessions -> claude=\(realClaude.count), codex=\(realCodex.count), dsh=\(realDSH.count), cursor=\(realCursor.count), ssh_hosts=\(sshEntries.count)")
+        print("PASS self-test | local sessions -> claude=\(realClaude.count), codex=\(realCodex.count), dsh=\(realDSH.count), cursor=\(realCursor.count), procs=\(warmProcs.count), ssh_hosts=\(sshEntries.count) | cold=\(coldElapsed), warm_full_poll=\(warmElapsed)")
         var allSessionsForMetrics = combinedReal
         if probeDSH {
             let snap = await DeepSeekAccountUsageService.fetchSnapshot()

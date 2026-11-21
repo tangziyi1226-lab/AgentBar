@@ -11,6 +11,30 @@ final class ActiveSessionViewDetector {
 
     private var trackedBundleID: String?
     private var trackedSince: Date = Date()
+    private var activationObserver: NSObjectProtocol?
+
+    private static var storageWorkspacesCache: [String: (stat: FastJSONL.FileStatKey?, targets: Set<WorkspaceTarget>)] = [:]
+    private static var sshAliasesCache: (checkedAt: TimeInterval, hostCount: Int, aliases: Set<String>)?
+
+    init() {
+        self.trackedBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        self.trackedSince = Date()
+        self.activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            let bundleID = app?.bundleIdentifier
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if bundleID != self.trackedBundleID {
+                    self.trackedBundleID = bundleID
+                    self.trackedSince = Date()
+                }
+            }
+        }
+    }
 
     private static let terminalBundleIDs: Set<String> = [
         "com.apple.Terminal",
@@ -179,22 +203,30 @@ final class ActiveSessionViewDetector {
         let home = NSHomeDirectory() as NSString
         for folder in appSupportFolders {
             let storagePath = home.appendingPathComponent("Library/Application Support/\(folder)/User/globalStorage/storage.json")
-            guard let data = try? Data(contentsOf: URL(fileURLWithPath: storagePath), options: .mappedIfSafe),
-                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let windowsState = root["windowsState"] as? [String: Any] else {
+            let curStat = FastJSONL.statKey(atPath: storagePath)
+            if let hit = storageWorkspacesCache[storagePath], hit.stat == curStat {
+                targets.formUnion(hit.targets)
                 continue
             }
-            if let lastActive = windowsState["lastActiveWindow"] as? [String: Any],
-               let target = parseWindowDict(lastActive) {
-                targets.insert(target)
-            }
-            if let opened = windowsState["openedWindows"] as? [[String: Any]] {
-                for win in opened {
-                    if let target = parseWindowDict(win) {
-                        targets.insert(target)
+            var parsed: Set<WorkspaceTarget> = []
+            if curStat != nil,
+               let data = try? Data(contentsOf: URL(fileURLWithPath: storagePath), options: .mappedIfSafe),
+               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let windowsState = root["windowsState"] as? [String: Any] {
+                if let lastActive = windowsState["lastActiveWindow"] as? [String: Any],
+                   let target = parseWindowDict(lastActive) {
+                    parsed.insert(target)
+                }
+                if let opened = windowsState["openedWindows"] as? [[String: Any]] {
+                    for win in opened {
+                        if let target = parseWindowDict(win) {
+                            parsed.insert(target)
+                        }
                     }
                 }
             }
+            storageWorkspacesCache[storagePath] = (curStat, parsed)
+            targets.formUnion(parsed)
         }
         return Array(targets)
     }
@@ -230,6 +262,10 @@ final class ActiveSessionViewDetector {
 
     private static func activeInteractiveSSHAliases(sshHosts: [SSHHostConfig]) -> Set<String> {
         guard !sshHosts.isEmpty else { return [] }
+        let nowTS = Date().timeIntervalSince1970
+        if let hit = sshAliasesCache, hit.hostCount == sshHosts.count, nowTS - hit.checkedAt < 6.0 {
+            return hit.aliases
+        }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/ps")
         proc.arguments = ["-eo", "tty=,comm=,args="]
@@ -273,6 +309,7 @@ final class ActiveSessionViewDetector {
                 }
             }
         }
+        sshAliasesCache = (nowTS, sshHosts.count, matched)
         return matched
     }
 }

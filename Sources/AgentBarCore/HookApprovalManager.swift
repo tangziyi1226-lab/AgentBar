@@ -21,6 +21,10 @@ public struct ApprovalDecisionPayload: Codable, Sendable {
 }
 
 public enum HookApprovalManager {
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var hooksInstalledCache: (stat: FastJSONL.FileStatKey?, installed: Bool)?
+    nonisolated(unsafe) private static var pendingDirStatCache: (stat: FastJSONL.FileStatKey?, items: [PendingApproval], checkedAt: TimeInterval)?
+
     public static var agentBarRuntimeDirectory: URL {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".agentbar", isDirectory: true)
     }
@@ -75,7 +79,23 @@ public enum HookApprovalManager {
     }
 
     public static func loadLocalPendingApprovals(maxAgeSeconds: TimeInterval = 180) -> [PendingApproval] {
-        ensureDirectories()
+        let pendingPath = pendingDirectory.path
+        let curStat = FastJSONL.statKey(atPath: pendingPath)
+        guard let curStat else {
+            ensureDirectories()
+            return []
+        }
+        let now = Date()
+        let nowTS = now.timeIntervalSince1970
+        cacheLock.lock()
+        if let cached = pendingDirStatCache,
+           cached.stat == curStat,
+           (cached.items.isEmpty || nowTS - cached.checkedAt < 5.0) {
+            cacheLock.unlock()
+            return cached.items
+        }
+        cacheLock.unlock()
+
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(at: pendingDirectory, includingPropertiesForKeys: nil) else {
             return []
@@ -83,7 +103,7 @@ public enum HookApprovalManager {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         var valid: [PendingApproval] = []
-        let now = Date()
+        var removedAny = false
         for url in files where url.pathExtension == "json" {
             guard let data = try? Data(contentsOf: url),
                   var item = try? decoder.decode(PendingApproval.self, from: data) else {
@@ -91,6 +111,7 @@ public enum HookApprovalManager {
             }
             if now.timeIntervalSince(item.requestedAt) > maxAgeSeconds {
                 try? fm.removeItem(at: url)
+                removedAny = true
                 continue
             }
             if item.highRiskMatchedRule == nil {
@@ -98,7 +119,12 @@ public enum HookApprovalManager {
             }
             valid.append(item)
         }
-        return valid.sorted { $0.requestedAt > $1.requestedAt }
+        let sorted = valid.sorted { $0.requestedAt > $1.requestedAt }
+        let finalStat = removedAny ? FastJSONL.statKey(atPath: pendingPath) : curStat
+        cacheLock.lock()
+        pendingDirStatCache = (finalStat, sorted, nowTS)
+        cacheLock.unlock()
+        return sorted
     }
 
     public static func submitDecision(
@@ -177,10 +203,24 @@ public enum HookApprovalManager {
     public static func isClaudeHooksInstalled() -> Bool {
         let settingsURL = URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent(".claude/settings.json")
-        guard let text = try? String(contentsOf: settingsURL, encoding: .utf8) else {
-            return false
+        let curStat = FastJSONL.statKey(atPath: settingsURL.path)
+        cacheLock.lock()
+        if let cached = hooksInstalledCache, cached.stat == curStat {
+            cacheLock.unlock()
+            return cached.installed
         }
-        return text.contains("agentbar-hook")
+        cacheLock.unlock()
+
+        let installed: Bool
+        if curStat != nil, let data = try? Data(contentsOf: settingsURL) {
+            installed = data.range(of: Data("agentbar-hook".utf8)) != nil
+        } else {
+            installed = false
+        }
+        cacheLock.lock()
+        hooksInstalledCache = (curStat, installed)
+        cacheLock.unlock()
+        return installed
     }
 
     public static func previewClaudeHooksJSON(hookExecutablePath: String) -> String {

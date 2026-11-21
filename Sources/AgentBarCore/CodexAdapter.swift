@@ -20,24 +20,112 @@ public struct CodexReadState: Sendable {
 }
 
 public enum CodexAdapter {
+    private struct ParsedRolloutCore {
+        var baseSession: AgentSession
+        var fallbackTitle: String?
+        var turnOpen: Bool
+        var hasAssistantMessage: Bool
+        var isArchivedFile: Bool
+        var isSubagent: Bool
+        var parentThreadID: String?
+
+        func materialize(
+            now: Date,
+            threadTitles: [String: String],
+            readState: CodexReadState,
+            seenAtByID: [String: TimeInterval]
+        ) -> ParsedRolloutResult? {
+            let rawID = baseSession.rawSessionID
+            let resolvedTitle = threadTitles[rawID] ?? fallbackTitle
+            guard let resolvedTitle, !resolvedTitle.isEmpty else {
+                return nil
+            }
+
+            var session = baseSession
+            session.title = resolvedTitle
+
+            let lastActivityAt = session.lastActivityAt
+            let sessionID = session.id
+            let age = now.timeIntervalSince(lastActivityAt)
+            let seenInAgentBar = SeenSessionLookup.isSeen(
+                sessionID: sessionID,
+                lastActivityAt: lastActivityAt,
+                seenAtByID: seenAtByID
+            )
+            let isCodexAppLocal = session.host.isLocal && (session.kind == .codexDesktop || session.launchEnvironment == .codexApp)
+            let seenByActivityTime = isCodexAppLocal
+                && (readState.userActivityAtByThreadID[rawID].map { $0 + 2.0 >= lastActivityAt.timeIntervalSince1970 } ?? false)
+            let stateFileSettled: Bool = {
+                if age >= 3.0 { return true }
+                guard let stateMtime = readState.stateFileUpdatedAt else { return false }
+                return stateMtime.timeIntervalSince(lastActivityAt) >= -1.5
+            }()
+            let seenByNativeUnread = isCodexAppLocal
+                && readState.hasReadState
+                && stateFileSettled
+                && !readState.unreadThreadIDs.contains(rawID)
+            let isSeen = isArchivedFile || seenInAgentBar || seenByActivityTime || seenByNativeUnread
+
+            let status: SessionStatus
+            if session.errorBanner != nil && age < 7200 {
+                status = .failed
+            } else if session.currentTool != nil && age < 900 {
+                status = .runningTool
+            } else if turnOpen && age < 600 {
+                status = .generating
+            } else if !isSeen && age < 1800 && hasAssistantMessage {
+                status = .completed
+            } else {
+                status = .waitingForInput
+            }
+
+            session.isSeen = isSeen
+            session.status = status
+            return ParsedRolloutResult(
+                session: session,
+                isSubagent: isSubagent,
+                parentThreadID: parentThreadID
+            )
+        }
+    }
+
     private struct CachedRolloutEntry {
-        var mtime: TimeInterval
-        var fileSize: Int
+        var stat: FastJSONL.FileStatKey
         var dayCutoff: TimeInterval
-        var result: ParsedRolloutResult?
+        var defaultProvider: String
+        var parsedTailCap: Int
+        var core: ParsedRolloutCore?
     }
 
     private static let rolloutCacheLock = NSLock()
     nonisolated(unsafe) private static var rolloutCache: [String: CachedRolloutEntry] = [:]
+    nonisolated(unsafe) private static var readStateCache: [String: (stat: FastJSONL.FileStatKey?, value: CodexReadState)] = [:]
+    nonisolated(unsafe) private static var threadIndexCache: [String: (stat: FastJSONL.FileStatKey?, value: [String: String])] = [:]
+    nonisolated(unsafe) private static var defaultProviderCache: [String: (stat: FastJSONL.FileStatKey?, value: String)] = [:]
 
     public static func loadReadState(homeDirectory: String = NSHomeDirectory()) -> CodexReadState {
         let path = (homeDirectory as NSString).appendingPathComponent(".codex/.codex-global-state.json")
-        let url = URL(fileURLWithPath: path)
-        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return CodexReadState()
+        let curStat = FastJSONL.statKey(atPath: path)
+        rolloutCacheLock.lock()
+        if let cached = readStateCache[path], cached.stat == curStat {
+            rolloutCacheLock.unlock()
+            return cached.value
         }
-        let mtime = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        rolloutCacheLock.unlock()
+
+        let url = URL(fileURLWithPath: path)
+        guard let curStat,
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            let empty = CodexReadState()
+            rolloutCacheLock.lock()
+            readStateCache[path] = (curStat, empty)
+            rolloutCacheLock.unlock()
+            return empty
+        }
+        let mtime = Date(
+            timeIntervalSince1970: Double(curStat.mtimeSec) + Double(curStat.mtimeNsec) / 1_000_000_000.0
+        )
 
         var hasReadState = false
         var unreadIDs: Set<String> = []
@@ -82,28 +170,47 @@ public enum CodexAdapter {
             }
         }
 
-        return CodexReadState(
+        let built = CodexReadState(
             hasReadState: hasReadState,
             unreadThreadIDs: unreadIDs,
             userActivityAtByThreadID: activityByThread,
             stateFileUpdatedAt: mtime
         )
+        rolloutCacheLock.lock()
+        readStateCache[path] = (curStat, built)
+        rolloutCacheLock.unlock()
+        return built
     }
 
     public static func loadThreadIndex(homeDirectory: String = NSHomeDirectory()) -> [String: String] {
         let path = (homeDirectory as NSString).appendingPathComponent(".codex/session_index.jsonl")
-        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [:] }
+        let curStat = FastJSONL.statKey(atPath: path)
+        rolloutCacheLock.lock()
+        if let cached = threadIndexCache[path], cached.stat == curStat {
+            rolloutCacheLock.unlock()
+            return cached.value
+        }
+        rolloutCacheLock.unlock()
+
+        guard curStat != nil,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe) else {
+            rolloutCacheLock.lock()
+            threadIndexCache[path] = (curStat, [:])
+            rolloutCacheLock.unlock()
+            return [:]
+        }
         var map: [String: String] = [:]
-        for line in content.split(whereSeparator: \.isNewline) {
-            guard let data = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let id = obj["id"] as? String,
+        FastJSONL.forEachJSONObject(in: data) { obj in
+            guard let id = obj["id"] as? String,
                   let name = obj["thread_name"] as? String,
                   !name.isEmpty else {
-                continue
+                return
             }
             map[id] = cleanThreadTitle(name)
         }
+        rolloutCacheLock.lock()
+        threadIndexCache[path] = (curStat, map)
+        rolloutCacheLock.unlock()
         return map
     }
 
@@ -121,21 +228,37 @@ public enum CodexAdapter {
 
     public static func detectDefaultProvider(homeDirectory: String = NSHomeDirectory()) -> String {
         let path = (homeDirectory as NSString).appendingPathComponent(".codex/config.toml")
-        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
-            return "OpenAI"
+        let curStat = FastJSONL.statKey(atPath: path)
+        rolloutCacheLock.lock()
+        if let cached = defaultProviderCache[path], cached.stat == curStat {
+            rolloutCacheLock.unlock()
+            return cached.value
         }
-        for line in content.split(whereSeparator: \.isNewline) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("model_provider") && trimmed.contains("=") {
-                let rhs = trimmed.split(separator: "=", maxSplits: 1).last?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-                if let rhs, !rhs.isEmpty {
-                    return FormattingHelpers.providerDisplay(from: rhs) ?? rhs
+        rolloutCacheLock.unlock()
+
+        let resolved: String = {
+            guard curStat != nil,
+                  let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+                return "OpenAI"
+            }
+            for line in content.split(whereSeparator: \.isNewline) {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("model_provider") && trimmed.contains("=") {
+                    let rhs = trimmed.split(separator: "=", maxSplits: 1).last?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                    if let rhs, !rhs.isEmpty {
+                        return FormattingHelpers.providerDisplay(from: rhs) ?? rhs
+                    }
                 }
             }
-        }
-        return "OpenAI"
+            return "OpenAI"
+        }()
+
+        rolloutCacheLock.lock()
+        defaultProviderCache[path] = (curStat, resolved)
+        rolloutCacheLock.unlock()
+        return resolved
     }
 
     public static func loadLocalSessions(
@@ -169,35 +292,46 @@ public enum CodexAdapter {
         for item in candidates.prefix(maxCandidateScan) {
             let fileAge = now.timeIntervalSince(item.mtime)
             let filePath = item.url.path
-            let fileSize = (try? item.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-            let mtimeTS = item.mtime.timeIntervalSince1970
-            let parsedOpt: ParsedRolloutResult?
+            guard let stat = FastJSONL.statKey(atPath: filePath) else { continue }
+            let requiredTailCap = fileAge > 1800 ? 98_304 : 2_500_000
+            let coreOpt: ParsedRolloutCore?
 
-            if fileAge > 1800,
-               let cached = lookupCachedRollout(path: filePath, mtime: mtimeTS, size: fileSize, dayCutoff: dayCutoffTS) {
-                parsedOpt = cached
+            if let cached = lookupCachedRollout(
+                path: filePath,
+                stat: stat,
+                dayCutoff: dayCutoffTS,
+                defaultProvider: defaultProvider,
+                requiredTailCap: requiredTailCap
+            ) {
+                coreOpt = cached
             } else {
-                let tailCap = fileAge > 1800 ? 98_304 : 2_500_000
-                guard let content = readTailUTF8(url: item.url, maxBytes: tailCap, dayCutoff: dayCutoff) else { continue }
-                let fresh = parseRolloutInternal(
-                    jsonl: content,
+                guard let contentData = readTailData(url: item.url, maxBytes: requiredTailCap) else { continue }
+                let fresh = parseRolloutCore(
+                    data: contentData,
                     filePath: filePath,
                     fileModificationDate: item.mtime,
                     host: .local,
-                    threadTitles: indexMap,
                     defaultProvider: defaultProvider,
                     allowSubagents: true,
-                    readState: readState,
-                    seenAtByID: seenAtByID,
                     dayCutoff: dayCutoff
                 )
-                if fileAge > 1800 {
-                    storeCachedRollout(path: filePath, mtime: mtimeTS, size: fileSize, dayCutoff: dayCutoffTS, result: fresh)
-                }
-                parsedOpt = fresh
+                storeCachedRollout(
+                    path: filePath,
+                    stat: stat,
+                    dayCutoff: dayCutoffTS,
+                    defaultProvider: defaultProvider,
+                    parsedTailCap: requiredTailCap,
+                    core: fresh
+                )
+                coreOpt = fresh
             }
 
-            if let parsed = parsedOpt {
+            if let parsed = coreOpt?.materialize(
+                now: now,
+                threadTitles: indexMap,
+                readState: readState,
+                seenAtByID: seenAtByID
+            ) {
                 if parsed.isSubagent && !includeSubagents {
                     if let parentID = parsed.parentThreadID, !parentID.isEmpty {
                         subagentRollups.append((parentID, parsed.session))
@@ -230,49 +364,52 @@ public enum CodexAdapter {
 
     private static func lookupCachedRollout(
         path: String,
-        mtime: TimeInterval,
-        size: Int,
-        dayCutoff: TimeInterval
-    ) -> ParsedRolloutResult?? {
+        stat: FastJSONL.FileStatKey,
+        dayCutoff: TimeInterval,
+        defaultProvider: String,
+        requiredTailCap: Int
+    ) -> ParsedRolloutCore?? {
         rolloutCacheLock.lock()
         defer { rolloutCacheLock.unlock() }
         guard let entry = rolloutCache[path],
-              entry.mtime == mtime,
-              entry.fileSize == size,
-              entry.dayCutoff == dayCutoff else {
+              entry.stat == stat,
+              entry.dayCutoff == dayCutoff,
+              entry.defaultProvider == defaultProvider,
+              entry.parsedTailCap >= requiredTailCap || stat.size <= entry.parsedTailCap else {
             return nil
         }
-        return entry.result
+        return entry.core
     }
 
     private static func storeCachedRollout(
         path: String,
-        mtime: TimeInterval,
-        size: Int,
+        stat: FastJSONL.FileStatKey,
         dayCutoff: TimeInterval,
-        result: ParsedRolloutResult?
+        defaultProvider: String,
+        parsedTailCap: Int,
+        core: ParsedRolloutCore?
     ) {
         rolloutCacheLock.lock()
         defer { rolloutCacheLock.unlock() }
-        if rolloutCache.count > 3000 {
+        if rolloutCache.count > 4000 {
             rolloutCache.removeAll(keepingCapacity: true)
         }
-        rolloutCache[path] = CachedRolloutEntry(mtime: mtime, fileSize: size, dayCutoff: dayCutoff, result: result)
+        rolloutCache[path] = CachedRolloutEntry(
+            stat: stat,
+            dayCutoff: dayCutoff,
+            defaultProvider: defaultProvider,
+            parsedTailCap: parsedTailCap,
+            core: core
+        )
     }
 
-    private static func readTailUTF8(
-        url: URL,
-        maxBytes: Int,
-        dayCutoff: Date = Calendar.current.startOfDay(for: Date())
-    ) -> String? {
-        _ = dayCutoff
+    private static func readTailData(url: URL, maxBytes: Int) -> Data? {
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
         if data.count <= maxBytes {
-            return String(data: data, encoding: .utf8)
+            return data
         }
         let newline: UInt8 = 0x0A
         let firstNewline = data.firstIndex(of: newline) ?? data.endIndex
-        let firstLine = String(decoding: data[data.startIndex..<firstNewline], as: UTF8.self)
         let afterFirstLine = firstNewline < data.endIndex ? data.index(after: firstNewline) : data.endIndex
 
         let rawTailStart = max(afterFirstLine, data.count - maxBytes)
@@ -283,20 +420,32 @@ public enum CodexAdapter {
             tailLineStart = data.endIndex
         }
 
-        var segments: [String] = [firstLine]
+        var anchorRanges: [Range<Int>] = []
         if afterFirstLine < tailLineStart {
-            var anchorLines = extractMetricAndContextLines(in: data, range: afterFirstLine..<tailLineStart)
-            if let lifecycle = latestLifecycleEventLine(in: data, range: afterFirstLine..<tailLineStart),
-               !anchorLines.contains(where: { $0.offset == lifecycle.offset }) {
-                anchorLines.append(lifecycle)
-                anchorLines.sort { $0.offset < $1.offset }
+            anchorRanges = extractMetricAndContextRanges(in: data, range: afterFirstLine..<tailLineStart)
+            if let lifecycleRange = latestLifecycleEventRange(in: data, range: afterFirstLine..<tailLineStart),
+               !anchorRanges.contains(where: { $0.lowerBound == lifecycleRange.lowerBound }) {
+                anchorRanges.append(lifecycleRange)
+                anchorRanges.sort { $0.lowerBound < $1.lowerBound }
             }
-            segments.append(contentsOf: anchorLines.map(\.line))
+        }
+
+        let approxBytes = firstNewline
+            + anchorRanges.reduce(0) { $0 + $1.count + 1 }
+            + max(0, data.endIndex - tailLineStart)
+            + 2
+        var combined = Data()
+        combined.reserveCapacity(approxBytes)
+        combined.append(data[data.startIndex..<firstNewline])
+        for r in anchorRanges {
+            combined.append(newline)
+            combined.append(data[r])
         }
         if tailLineStart < data.endIndex {
-            segments.append(String(decoding: data[tailLineStart..<data.endIndex], as: UTF8.self))
+            combined.append(newline)
+            combined.append(data[tailLineStart..<data.endIndex])
         }
-        return segments.joined(separator: "\n")
+        return combined
     }
 
     private static let tokenCountNeedle = Data("\"token_count\"".utf8)
@@ -304,13 +453,13 @@ public enum CodexAdapter {
     private static let threadSettingsNeedle = Data("\"thread_settings_applied\"".utf8)
     private static let responseItemTypeNeedle = Data("\"type\":\"response_item\"".utf8)
 
-    private static func extractMetricAndContextLines(
+    private static func extractMetricAndContextRanges(
         in data: Data,
         range: Range<Int>
-    ) -> [(offset: Int, line: String)] {
+    ) -> [Range<Int>] {
         let newline: UInt8 = 0x0A
         var seenOffsets: Set<Int> = []
-        var collected: [(offset: Int, line: String)] = []
+        var collected: [Range<Int>] = []
 
         for needle in [tokenCountNeedle, turnContextTypeNeedle, threadSettingsNeedle] {
             var cursor = range.lowerBound
@@ -333,10 +482,10 @@ public enum CodexAdapter {
                 if lineData.range(of: responseItemTypeNeedle) != nil {
                     continue
                 }
-                collected.append((lineStart, String(decoding: lineData, as: UTF8.self)))
+                collected.append(lineStart..<lineEnd)
             }
         }
-        collected.sort { $0.offset < $1.offset }
+        collected.sort { $0.lowerBound < $1.lowerBound }
         return collected
     }
 
@@ -354,10 +503,9 @@ public enum CodexAdapter {
         "error"
     ]
 
-    private static func latestLifecycleEventLine(in data: Data, range: Range<Int>) -> (offset: Int, line: String)? {
+    private static func latestLifecycleEventRange(in data: Data, range: Range<Int>) -> Range<Int>? {
         let newline: UInt8 = 0x0A
-        var bestStart = -1
-        var bestLine: String?
+        var bestRange: Range<Int>?
 
         for needle in lifecycleNeedles {
             var searchUpper = range.upperBound
@@ -373,7 +521,7 @@ public enum CodexAdapter {
                 } else {
                     lineStart = range.lowerBound
                 }
-                if lineStart <= bestStart {
+                if let existing = bestRange, lineStart <= existing.lowerBound {
                     break
                 }
                 let lineEnd = data[hit.upperBound..<range.upperBound].firstIndex(of: newline) ?? range.upperBound
@@ -383,15 +531,13 @@ public enum CodexAdapter {
                    let payload = obj["payload"] as? [String: Any],
                    let ptype = payload["type"] as? String,
                    lifecycleEventTypes.contains(ptype) {
-                    bestStart = lineStart
-                    bestLine = String(decoding: lineData, as: UTF8.self)
+                    bestRange = lineStart..<lineEnd
                     break
                 }
                 searchUpper = lineStart > range.lowerBound ? (lineStart - 1) : range.lowerBound
             }
         }
-        guard let bestLine, bestStart >= 0 else { return nil }
-        return (bestStart, bestLine)
+        return bestRange
     }
 
     public static func parseRollout(
@@ -406,17 +552,19 @@ public enum CodexAdapter {
         seenAtByID: [String: TimeInterval] = [:],
         dayCutoff: Date = Calendar.current.startOfDay(for: Date())
     ) -> AgentSession? {
-        parseRolloutInternal(
-            jsonl: jsonl,
+        parseRolloutCore(
+            data: Data(jsonl.utf8),
             filePath: filePath,
             fileModificationDate: fileModificationDate,
             host: host,
-            threadTitles: threadTitles,
             defaultProvider: defaultProvider,
             allowSubagents: includeSubagents,
-            readState: readState,
-            seenAtByID: seenAtByID,
             dayCutoff: dayCutoff
+        )?.materialize(
+            now: Date(),
+            threadTitles: threadTitles,
+            readState: readState,
+            seenAtByID: seenAtByID
         )?.session
     }
 
@@ -426,18 +574,15 @@ public enum CodexAdapter {
         var parentThreadID: String?
     }
 
-    private static func parseRolloutInternal(
-        jsonl: String,
+    private static func parseRolloutCore(
+        data: Data,
         filePath: String?,
         fileModificationDate: Date,
         host: HostID,
-        threadTitles: [String: String] = [:],
         defaultProvider: String = "OpenAI",
         allowSubagents: Bool = false,
-        readState: CodexReadState = CodexReadState(),
-        seenAtByID: [String: TimeInterval] = [:],
         dayCutoff: Date = Calendar.current.startOfDay(for: Date())
-    ) -> ParsedRolloutResult? {
+    ) -> ParsedRolloutCore? {
         var rawID = URL(fileURLWithPath: filePath ?? "codex").deletingPathExtension().lastPathComponent
         if let uuidRange = rawID.range(
             of: #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"#,
@@ -454,6 +599,7 @@ public enum CodexAdapter {
         var usage = TokenUsage()
         var isForkedThread = false
         var isSubagent = false
+        var rejectedSubagent = false
         var parentThreadID: String?
         var sawFirstTokenCount = false
         var hasShardScopedToday = false
@@ -492,11 +638,8 @@ public enum CodexAdapter {
             }
         }
 
-        for lineSub in jsonl.split(whereSeparator: \.isNewline) {
-            guard let data = lineSub.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                continue
-            }
+        FastJSONL.forEachJSONObject(in: data) { obj in
+            if rejectedSubagent { return }
             let ts = ClaudeCodeAdapter.parseISODate(obj["timestamp"] as? String)
             if let ts {
                 if startedAt == nil { startedAt = ts }
@@ -507,13 +650,14 @@ public enum CodexAdapter {
 
             switch type {
             case "session_meta":
-                guard let payload else { continue }
+                guard let payload else { return }
                 let sourceObj = payload["source"] as? [String: Any]
                 let isSubagentMeta = sourceObj?["subagent"] != nil
                     || (payload["thread_source"] as? String) == "subagent"
                 if isSubagentMeta {
                     if !allowSubagents {
-                        return nil
+                        rejectedSubagent = true
+                        return
                     }
                     isSubagent = true
                     isForkedThread = true
@@ -562,7 +706,7 @@ public enum CodexAdapter {
 
             case "turn_context":
                 markInTurnActivity()
-                guard let payload else { continue }
+                guard let payload else { return }
                 if let dir = payload["cwd"] as? String, !dir.isEmpty {
                     cwd = dir
                 }
@@ -585,7 +729,7 @@ public enum CodexAdapter {
                 }
 
             case "event_msg":
-                guard let payload else { continue }
+                guard let payload else { return }
                 let ptype = (payload["type"] as? String) ?? ""
                 switch ptype {
                 case "thread_settings_applied":
@@ -723,7 +867,7 @@ public enum CodexAdapter {
                 }
 
             case "response_item":
-                guard let payload else { continue }
+                guard let payload else { return }
                 let rtype = (payload["type"] as? String) ?? ""
                 switch rtype {
                 case "reasoning":
@@ -776,20 +920,19 @@ public enum CodexAdapter {
             }
         }
 
+        if rejectedSubagent || (isSubagent && !allowSubagents) {
+            return nil
+        }
+
         let hasRealActivity = turnOpen
             || !openTools.isEmpty
             || totalTools > 0
             || lastAssistantMessage != nil
             || usage.totalTokens > 0
 
-        let title = threadTitles[rawID]
-            ?? firstUserMessage.map { ClaudeCodeAdapter.firstSingleLine($0, maxLength: 44) }
+        let fallbackTitle = firstUserMessage.map { ClaudeCodeAdapter.firstSingleLine($0, maxLength: 44) }
             ?? (hasRealActivity ? cwd.map { "\(URL(fileURLWithPath: $0).lastPathComponent) 会话" } : nil)
             ?? (hasRealActivity ? "Codex 会话" : nil)
-
-        guard let title, !title.isEmpty else {
-            return nil
-        }
 
         var tokPerSec: Double?
         if let durMs = lastDurationMs, durMs > 200, let outTok = lastTurnOutputTokens, outTok > 0 {
@@ -802,39 +945,7 @@ public enum CodexAdapter {
         let recentTail = Array(recent.suffix(5).reversed())
 
         let sessionID = "\(host.storageKey):codex:\(rawID)"
-        let age = Date().timeIntervalSince(lastActivityAt)
-        let seenInAgentBar = SeenSessionLookup.isSeen(
-            sessionID: sessionID,
-            lastActivityAt: lastActivityAt,
-            seenAtByID: seenAtByID
-        )
-        let isCodexAppLocal = host.isLocal && (kind == .codexDesktop || launchEnv == .codexApp)
-        let seenByActivityTime = isCodexAppLocal
-            && (readState.userActivityAtByThreadID[rawID].map { $0 + 2.0 >= lastActivityAt.timeIntervalSince1970 } ?? false)
-        let stateFileSettled: Bool = {
-            if age >= 3.0 { return true }
-            guard let stateMtime = readState.stateFileUpdatedAt else { return false }
-            return stateMtime.timeIntervalSince(lastActivityAt) >= -1.5
-        }()
-        let seenByNativeUnread = isCodexAppLocal
-            && readState.hasReadState
-            && stateFileSettled
-            && !readState.unreadThreadIDs.contains(rawID)
         let isArchivedFile = (filePath ?? "").contains("/archived_sessions/")
-        let isSeen = isArchivedFile || seenInAgentBar || seenByActivityTime || seenByNativeUnread
-
-        let status: SessionStatus
-        if errorBanner != nil && age < 7200 {
-            status = .failed
-        } else if currentTool != nil && age < 900 {
-            status = .runningTool
-        } else if turnOpen && age < 600 {
-            status = .generating
-        } else if !isSeen && age < 1800 && lastAssistantMessage != nil {
-            status = .completed
-        } else {
-            status = .waitingForInput
-        }
 
         let overview: String
         if let err = errorBanner {
@@ -853,14 +964,14 @@ public enum CodexAdapter {
             ? latestTodayShardOwn.subtractingClamped(preTodayShardOwn)
             : TokenUsage()
 
-        let session = AgentSession(
+        let baseSession = AgentSession(
             id: sessionID,
             rawSessionID: rawID,
             kind: kind,
             host: host,
-            title: title,
+            title: fallbackTitle ?? "",
             overview: overview,
-            status: status,
+            status: .waitingForInput,
             cwd: cwd,
             groupDirectory: cwd,
             provider: provider,
@@ -887,10 +998,14 @@ public enum CodexAdapter {
             launchEnvironment: launchEnv,
             startedAt: startedAt ?? fileModificationDate,
             lastActivityAt: lastActivityAt,
-            isSeen: isSeen
+            isSeen: isArchivedFile
         )
-        return ParsedRolloutResult(
-            session: session,
+        return ParsedRolloutCore(
+            baseSession: baseSession,
+            fallbackTitle: fallbackTitle,
+            turnOpen: turnOpen,
+            hasAssistantMessage: lastAssistantMessage != nil,
+            isArchivedFile: isArchivedFile,
             isSubagent: isSubagent,
             parentThreadID: parentThreadID
         )

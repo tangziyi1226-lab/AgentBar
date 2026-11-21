@@ -69,8 +69,29 @@ final class ClearGlassHostView: NSView {
     }
 }
 
+private struct PanelHostRootView: View {
+    let model: AppModel
+    let onOpenSettings: () -> Void
+
+    var body: some View {
+        if model.isPanelVisible {
+            PanelView(model: model, onOpenSettings: onOpenSettings)
+        } else {
+            Color.clear
+                .frame(width: PanelView.panelWidth, height: 200)
+        }
+    }
+}
+
 @MainActor
 final class StatusBarController: NSObject {
+    private struct StatusBadgeRenderKey: Equatable {
+        var counts: MenuBarCounts
+        var totalSessionCount: Int
+        var style: MenuBarIconStyle
+        var isDarkMenuBar: Bool
+    }
+
     private static let shadowInset: CGFloat = 28
     private static let glassCornerRadius: CGFloat = 22
 
@@ -86,6 +107,7 @@ final class StatusBarController: NSObject {
     private var anchorMidX: CGFloat?
     private weak var anchorScreen: NSScreen?
     private var resizeScheduled = false
+    private var lastBadgeKey: StatusBadgeRenderKey?
 
     init(model: AppModel) {
         self.model = model
@@ -141,7 +163,7 @@ final class StatusBarController: NSObject {
         glassView.cornerRadius = Self.glassCornerRadius
         glassView.autoresizingMask = [.width, .height]
 
-        let rootView = PanelView(model: model) { [weak self] in
+        let rootView = PanelHostRootView(model: model) { [weak self] in
             self?.openSettingsWindow()
         }
         let hostingView = NSHostingView(rootView: rootView)
@@ -167,11 +189,21 @@ final class StatusBarController: NSObject {
     func updateStatusButtonImage() {
         guard let button = statusItem.button else { return }
         let isDark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let img = MenuBarBadgeRenderer.renderStatusImage(
+        let key = StatusBadgeRenderKey(
             counts: model.menuBarCounts,
             totalSessionCount: model.sessions.count,
             style: model.menuBarStyle,
             isDarkMenuBar: isDark
+        )
+        if key == lastBadgeKey, button.image != nil {
+            return
+        }
+        lastBadgeKey = key
+        let img = MenuBarBadgeRenderer.renderStatusImage(
+            counts: key.counts,
+            totalSessionCount: key.totalSessionCount,
+            style: key.style,
+            isDarkMenuBar: key.isDarkMenuBar
         )
         button.image = img
     }
@@ -191,13 +223,13 @@ final class StatusBarController: NSObject {
         self.anchorTopY = buttonFrameInScreen.minY - 6.0
         self.anchorScreen = buttonWindow.screen ?? NSScreen.main
 
+        model.panelDidOpen()
         let initialFrame = computeTargetPanelFrame()
         panel.setFrame(initialFrame, display: false)
         panel.contentView?.layoutSubtreeIfNeeded()
         let finalFrame = computeTargetPanelFrame()
         panel.setFrame(finalFrame, display: true)
         panel.makeKeyAndOrderFront(nil)
-        model.panelDidOpen()
         installDismissMonitors()
 
         scheduleResizeVisiblePanel()

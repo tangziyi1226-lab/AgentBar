@@ -187,17 +187,41 @@ final class AppModel {
         self.isShowingOverview = showcaseOverview
     }
 
+    @ObservationIgnored
+    private var cachedAnalytics: (
+        revision: Int,
+        demoMode: Bool,
+        dayStart: Date,
+        sessions: [AgentSession],
+        homes: [HostID: String],
+        snapshot: TotalAnalyticsSnapshot
+    )?
+
     var menuBarCounts: MenuBarCounts {
         SessionGroupingBuilder.computeMenuBarCounts(sessions: sessions)
     }
 
     var totalAnalytics: TotalAnalyticsSnapshot {
-        _ = pricingRevision
-        return SubscriptionAndStatsService.buildAnalytics(
-            sessions: sessions,
-            demoMode: demoModeEnabled,
-            homeByHost: remoteHomes
+        let rev = pricingRevision
+        let demo = demoModeEnabled
+        let curSessions = sessions
+        let curHomes = remoteHomes
+        let dayStart = Calendar.current.startOfDay(for: Date())
+        if let hit = cachedAnalytics,
+           hit.revision == rev,
+           hit.demoMode == demo,
+           hit.dayStart == dayStart,
+           hit.sessions == curSessions,
+           hit.homes == curHomes {
+            return hit.snapshot
+        }
+        let fresh = SubscriptionAndStatsService.buildAnalytics(
+            sessions: curSessions,
+            demoMode: demo,
+            homeByHost: curHomes
         )
+        cachedAnalytics = (rev, demo, dayStart, curSessions, curHomes, fresh)
+        return fresh
     }
 
     var filteredHostGroups: [HostSessionGroup] {
@@ -858,45 +882,83 @@ final class AppModel {
         let lookback = lookbackHours
         let subagents = includeSubagents
         let seen = seenAtBySessionID
+        let agPlan = antigravityPlan
+        let agQuotas = antigravityQuotas
+        let dshAcct = deepSeekAccount
+        let remoteExisting = sessions.filter { !$0.host.isLocal }
 
-        async let claudeList = ClaudeCodeAdapter.loadLocalSessions(
-            lookbackHours: lookback,
-            includeSubagents: subagents,
-            seenAtByID: seen
-        )
-        async let codexList = CodexAdapter.loadLocalSessions(lookbackHours: lookback, includeSubagents: subagents, seenAtByID: seen)
-        async let dshList = DeepSeekHarnessAdapter.loadLocalSessions(lookbackHours: lookback, seenAtByID: seen)
-        async let cursorList = CursorTraeAdapter.loadLocalSessions(lookbackHours: lookback, seenAtByID: seen)
-        async let antigravityList = AntigravityAdapter.loadLocalSessions(lookbackHours: lookback, seenAtByID: seen)
+        let bgResult = await Task.detached(priority: .utility) {
+            async let claudeList = ClaudeCodeAdapter.loadLocalSessions(
+                lookbackHours: lookback,
+                includeSubagents: subagents,
+                seenAtByID: seen
+            )
+            async let codexList = CodexAdapter.loadLocalSessions(
+                lookbackHours: lookback,
+                includeSubagents: subagents,
+                seenAtByID: seen
+            )
+            async let dshList = DeepSeekHarnessAdapter.loadLocalSessions(
+                lookbackHours: lookback,
+                seenAtByID: seen
+            )
+            async let cursorList = CursorTraeAdapter.loadLocalSessions(
+                lookbackHours: lookback,
+                seenAtByID: seen
+            )
+            async let antigravityList = AntigravityAdapter.loadLocalSessions(
+                lookbackHours: lookback,
+                seenAtByID: seen
+            )
 
-        let antigravity = await antigravityList
-        var local = SessionDeduplicator.deduplicate(await (claudeList + codexList + dshList + cursorList) + antigravity)
-        let procs = await Task.detached(priority: .utility) {
-            ProcessAndChatScanner.scanLocalAgentProcesses()
+            let antigravity = await antigravityList
+            var local = SessionDeduplicator.deduplicate(await (claudeList + codexList + dshList + cursorList) + antigravity)
+            let procs = ProcessAndChatScanner.scanLocalAgentProcesses()
+            ProcessAndChatScanner.attachProcesses(to: &local, processes: procs)
+            let pendingApprovals = HookApprovalManager.loadLocalPendingApprovals()
+            let combinedPreview = SessionDeduplicator.deduplicate(local + remoteExisting)
+            let cards = SubscriptionAndStatsService.detectLocalSubscriptions(
+                sessions: combinedPreview,
+                antigravityPlan: agPlan,
+                antigravityQuotas: agQuotas,
+                deepSeekAccount: dshAcct
+            )
+            return (local: local, antigravityEmpty: antigravity.isEmpty, procs: procs, pendingApprovals: pendingApprovals, cards: cards)
         }.value
-        ProcessAndChatScanner.attachProcesses(to: &local, processes: procs)
-        if antigravity.isEmpty, let appSession = AntigravityAdapter.runningDesktopSession(processes: procs) {
+
+        guard !demoModeEnabled else { return }
+        var local = bgResult.local
+        if bgResult.antigravityEmpty, let appSession = AntigravityAdapter.runningDesktopSession(processes: bgResult.procs) {
             local.append(appSession)
         }
-
-        let pendingApprovals = HookApprovalManager.loadLocalPendingApprovals()
-        mergePendingApprovals(pendingApprovals, into: &local, host: .local)
+        mergePendingApprovals(bgResult.pendingApprovals, into: &local, host: .local)
         applyLiveSeenState(to: &local)
 
-        let remoteExisting = sessions.filter { !$0.host.isLocal }
-        self.sessions = SessionDeduplicator.deduplicate(local + remoteExisting)
-        self.hostStates[.local] = HostConnectionState(host: .local, isOnline: true)
-        updateSubscriptionCards()
+        let currentRemotes = sessions.filter { !$0.host.isLocal }
+        let nextSessions = SessionDeduplicator.deduplicate(local + currentRemotes)
+        if self.sessions != nextSessions {
+            self.sessions = nextSessions
+        }
+        let localState = HostConnectionState(host: .local, isOnline: true)
+        if self.hostStates[.local] != localState {
+            self.hostStates[.local] = localState
+        }
+        if self.subscriptionCards != bgResult.cards {
+            self.subscriptionCards = bgResult.cards
+        }
         notifyStatusBar()
     }
 
     private func updateSubscriptionCards() {
-        subscriptionCards = SubscriptionAndStatsService.detectLocalSubscriptions(
+        let nextCards = SubscriptionAndStatsService.detectLocalSubscriptions(
             sessions: sessions,
             antigravityPlan: antigravityPlan,
             antigravityQuotas: antigravityQuotas,
             deepSeekAccount: deepSeekAccount
         )
+        if subscriptionCards != nextCards {
+            subscriptionCards = nextCards
+        }
     }
 
     func refreshSSHHosts() async {
@@ -1203,28 +1265,30 @@ final class AppModel {
     }
 
     private func startBackgroundPolling() {
-        localPollTask = Task { [weak self] in
+        localPollTask = Task(priority: .utility) { [weak self] in
             guard let self else { return }
             await self.refreshAll(includeBalances: true)
             while !Task.isCancelled {
-                let fastPoll = self.menuBarCounts.completedUnseen > 0
-                try? await Task.sleep(for: .seconds(fastPoll ? 2.2 : 4.0))
+                let counts = self.menuBarCounts
+                let hasActiveWork = counts.activeGenerating > 0 || counts.awaitingApproval > 0 || self.isPanelVisible
+                try? await Task.sleep(for: .seconds(hasActiveWork ? 2.5 : 5.0))
                 if !self.demoModeEnabled {
                     await self.refreshLocalSessions()
                 }
             }
         }
-        sshPollTask = Task { [weak self] in
+        sshPollTask = Task(priority: .utility) { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(25))
                 guard let self, !self.demoModeEnabled else { continue }
                 await self.refreshSSHHosts()
             }
         }
-        viewDetectorTask = Task { [weak self] in
+        viewDetectorTask = Task(priority: .utility) { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1.2))
-                guard let self, !self.demoModeEnabled else { continue }
+                let hasUnseenCompleted = self.map { !$0.demoModeEnabled && $0.menuBarCounts.completedUnseen > 0 } ?? false
+                try? await Task.sleep(for: .seconds(hasUnseenCompleted ? 1.5 : 4.0))
+                guard let self, !self.demoModeEnabled, self.menuBarCounts.completedUnseen > 0 else { continue }
                 let viewedIDs = self.viewDetector.detectViewedSessionIDs(
                     sessions: self.sessions,
                     sshHosts: self.sshHosts

@@ -1,6 +1,40 @@
 import Foundation
 
 public enum DeepSeekHarnessAdapter {
+    private struct ProjectionCore {
+        var baseSession: AgentSession
+        var hasPendingToolCalls: Bool
+        var turnOpen: Bool
+        var hasResponseOrDraft: Bool
+
+        func materialize(fileModificationDate: Date, seenAtByID: [String: TimeInterval], now: Date) -> AgentSession {
+            var session = baseSession
+            session.lastActivityAt = fileModificationDate
+            let isSeen = SeenSessionLookup.isSeen(
+                sessionID: session.id,
+                lastActivityAt: fileModificationDate,
+                seenAtByID: seenAtByID
+            )
+            let age = now.timeIntervalSince(fileModificationDate)
+            let status: SessionStatus
+            if hasPendingToolCalls && age < 600 {
+                status = .runningTool
+            } else if turnOpen && age < 300 {
+                status = .generating
+            } else if !isSeen && age < 1800 && hasResponseOrDraft {
+                status = .completed
+            } else {
+                status = .waitingForInput
+            }
+            session.isSeen = isSeen
+            session.status = status
+            return session
+        }
+    }
+
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var projectionCache: [String: (stat: FastJSONL.FileStatKey, core: ProjectionCore?)] = [:]
+
     public static func loadLocalSessions(
         homeDirectory: String = NSHomeDirectory(),
         lookbackHours: Double = 96,
@@ -15,22 +49,44 @@ public enum DeepSeekHarnessAdapter {
         ) else {
             return []
         }
-        let cutoff = Date().addingTimeInterval(-lookbackHours * 3600)
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-lookbackHours * 3600)
         var results: [AgentSession] = []
         for url in items where url.pathExtension == "json" {
             let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            guard mtime >= cutoff,
-                  let data = try? Data(contentsOf: url),
-                  var session = parseProjection(
-                      data: data,
-                      fallbackID: url.deletingPathExtension().lastPathComponent,
-                      filePath: url.path,
-                      fileModificationDate: mtime,
-                      host: .local,
-                      seenAtByID: seenAtByID
-                  ) else {
-                continue
+            guard mtime >= cutoff else { continue }
+            let filePath = url.path
+            guard let stat = FastJSONL.statKey(atPath: filePath) else { continue }
+
+            let cachedHit: (found: Bool, core: ProjectionCore?) = cacheLock.withLock {
+                if let hit = projectionCache[filePath], hit.stat == stat {
+                    return (true, hit.core)
+                }
+                return (false, nil)
             }
+            let coreOpt: ProjectionCore?
+            if cachedHit.found {
+                coreOpt = cachedHit.core
+            } else {
+                guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { continue }
+                let fresh = parseProjectionCore(
+                    data: data,
+                    fallbackID: url.deletingPathExtension().lastPathComponent,
+                    filePath: filePath,
+                    fileModificationDate: mtime,
+                    host: .local
+                )
+                cacheLock.withLock {
+                    if projectionCache.count > 2000 {
+                        projectionCache.removeAll(keepingCapacity: true)
+                    }
+                    projectionCache[filePath] = (stat, fresh)
+                }
+                coreOpt = fresh
+            }
+
+            guard let core = coreOpt else { continue }
+            var session = core.materialize(fileModificationDate: mtime, seenAtByID: seenAtByID, now: now)
             session.groupDirectory = await GitRootResolver.shared.resolveGroupDirectory(for: session.cwd)
             results.append(session)
         }
@@ -45,6 +101,26 @@ public enum DeepSeekHarnessAdapter {
         host: HostID,
         seenAtByID: [String: TimeInterval] = [:]
     ) -> AgentSession? {
+        parseProjectionCore(
+            data: data,
+            fallbackID: fallbackID,
+            filePath: filePath,
+            fileModificationDate: fileModificationDate,
+            host: host
+        )?.materialize(
+            fileModificationDate: fileModificationDate,
+            seenAtByID: seenAtByID,
+            now: Date()
+        )
+    }
+
+    private static func parseProjectionCore(
+        data: Data,
+        fallbackID: String,
+        filePath: String?,
+        fileModificationDate: Date,
+        host: HostID
+    ) -> ProjectionCore? {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let record = root["record"] as? [String: Any],
               let rows = record["rows"] as? [String: Any] else {
@@ -129,24 +205,6 @@ public enum DeepSeekHarnessAdapter {
         let turnOpen = (approvalVal?["turnOpen"] as? Bool) ?? false
 
         let sessionID = "\(host.storageKey):dsh:\(fallbackID)"
-        let isSeen = SeenSessionLookup.isSeen(
-            sessionID: sessionID,
-            lastActivityAt: fileModificationDate,
-            seenAtByID: seenAtByID
-        )
-        let age = Date().timeIntervalSince(fileModificationDate)
-
-        let status: SessionStatus
-        if hasPendingToolCalls && age < 600 {
-            status = .runningTool
-        } else if turnOpen && age < 300 {
-            status = .generating
-        } else if !isSeen && age < 1800 && (lastResponse != nil || draft != nil) {
-            status = .completed
-        } else {
-            status = .waitingForInput
-        }
-
         let outputMarkdown = (lastResponse?.isEmpty == false ? lastResponse : draft)
         let overview: String
         if let draft, !draft.isEmpty && turnOpen {
@@ -159,14 +217,14 @@ public enum DeepSeekHarnessAdapter {
             overview = "DeepSeek Harness 会话"
         }
 
-        return AgentSession(
+        let baseSession = AgentSession(
             id: sessionID,
             rawSessionID: fallbackID,
             kind: .deepseekHarness,
             host: host,
             title: title,
             overview: overview,
-            status: status,
+            status: .waitingForInput,
             cwd: cwd,
             groupDirectory: cwd,
             provider: provider,
@@ -182,7 +240,13 @@ public enum DeepSeekHarnessAdapter {
             sourceFilePath: filePath,
             startedAt: startedAt,
             lastActivityAt: fileModificationDate,
-            isSeen: isSeen
+            isSeen: false
+        )
+        return ProjectionCore(
+            baseSession: baseSession,
+            hasPendingToolCalls: hasPendingToolCalls,
+            turnOpen: turnOpen,
+            hasResponseOrDraft: lastResponse != nil || draft != nil
         )
     }
 }

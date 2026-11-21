@@ -4,37 +4,127 @@ import Darwin
 import Foundation
 
 public enum ProcessAndChatScanner {
-    public static func scanLocalAgentProcesses() -> [ProcessStats] {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
-        proc.arguments = ["-eo", "pid=,pcpu=,rss=,tty=,comm="]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        do {
-            try proc.run()
-        } catch {
-            return []
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        proc.waitUntilExit()
-        guard let output = String(data: data, encoding: .utf8) else { return [] }
+    private struct CPUSample {
+        var totalMachTicks: UInt64
+        var uptimeNs: UInt64
+        var lastPercent: Double
+    }
 
+    private static let cpuLock = NSLock()
+    nonisolated(unsafe) private static var prevCPUSamples: [Int32: CPUSample] = [:]
+    private static let timebaseNumerDenom: (numer: Double, denom: Double) = {
+        var tb = mach_timebase_info_data_t()
+        mach_timebase_info(&tb)
+        let denom = tb.denom > 0 ? Double(tb.denom) : 1.0
+        return (Double(tb.numer), denom)
+    }()
+
+    private static let agentAsciiKeywords: [[UInt8]] = [
+        Array("claude".utf8),
+        Array("codex".utf8),
+        Array("chatgpt.app".utf8),
+        Array("cursor".utf8),
+        Array("trae".utf8),
+        Array("antigravity".utf8),
+        Array("deepseek".utf8),
+        Array("doubao".utf8),
+        Array("dsh".utf8)
+    ]
+
+    private static func asciiContainsAnyAgentKeyword(_ bytes: ArraySlice<UInt8>) -> Bool {
+        let count = bytes.count
+        guard count >= 3 else { return false }
+        return bytes.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+            for kw in agentAsciiKeywords {
+                let kLen = kw.count
+                guard count >= kLen else { continue }
+                let first = kw[0]
+                let limit = count - kLen
+                var i = 0
+                while i <= limit {
+                    let b0 = base[i]
+                    let c0 = (b0 >= 0x41 && b0 <= 0x5A) ? (b0 &+ 32) : b0
+                    if c0 == first {
+                        var match = true
+                        var j = 1
+                        while j < kLen {
+                            let bj = base[i &+ j]
+                            let cj = (bj >= 0x41 && bj <= 0x5A) ? (bj &+ 32) : bj
+                            if cj != kw[j] {
+                                match = false
+                                break
+                            }
+                            j &+= 1
+                        }
+                        if match { return true }
+                    }
+                    i &+= 1
+                }
+            }
+            return false
+        }
+    }
+
+    public static func scanLocalAgentProcesses() -> [ProcessStats] {
+        let estimatedBytes = proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0)
+        guard estimatedBytes > 0 else { return [] }
+
+        let capacity = Int(estimatedBytes) / MemoryLayout<pid_t>.stride + 64
+        var pids = [pid_t](repeating: 0, count: capacity)
+        let actualBytes = pids.withUnsafeMutableBytes { rawBuf -> Int32 in
+            guard let base = rawBuf.baseAddress else { return 0 }
+            return proc_listpids(UInt32(PROC_ALL_PIDS), 0, base, Int32(rawBuf.count))
+        }
+        guard actualBytes > 0 else { return [] }
+        let pidCount = Int(actualBytes) / MemoryLayout<pid_t>.stride
+
+        let currentUID = getuid()
+        let bsdStride = Int32(MemoryLayout<proc_bsdinfo>.stride)
+        let taskStride = Int32(MemoryLayout<proc_taskinfo>.stride)
+        var pathBuffer = [UInt8](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        let nowUptimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+
+        var activeMatchedPIDs: Set<Int32> = []
         var results: [ProcessStats] = []
-        for line in output.split(whereSeparator: \.isNewline) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            let parts = trimmed.split(maxSplits: 4, omittingEmptySubsequences: true, whereSeparator: \.isWhitespace)
-            guard parts.count >= 5,
-                  let pid = Int32(parts[0]) else {
+
+        for idx in 0..<pidCount {
+            let pid = pids[idx]
+            guard pid > 0 else { continue }
+
+            var bsd = proc_bsdinfo()
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, bsdStride) == bsdStride else {
                 continue
             }
-            let cpu = Double(parts[1]) ?? 0.0
-            let rssKB = UInt64(parts[2]) ?? 0
-            let tty = String(parts[3])
-            let comm = String(parts[4])
+            guard bsd.pbi_uid == currentUID, bsd.pbi_status != UInt32(SZOMB) else {
+                continue
+            }
+
+            let comm: String
+            let pathLen = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+            if pathLen > 0 {
+                let slice = pathBuffer[0..<Int(pathLen)]
+                guard asciiContainsAnyAgentKeyword(slice) else { continue }
+                comm = String(decoding: slice, as: UTF8.self)
+            } else {
+                comm = withUnsafePointer(to: &bsd.pbi_name) { ptr in
+                    ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN) * 2) { cStr in
+                        let s = String(cString: cStr)
+                        if !s.isEmpty { return s }
+                        return withUnsafePointer(to: &bsd.pbi_comm) { commPtr in
+                            commPtr.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) {
+                                String(cString: $0)
+                            }
+                        }
+                    }
+                }
+                guard !comm.isEmpty else { continue }
+            }
+
             let lower = comm.lowercased()
             guard lower.contains("claude")
                 || lower.contains("codex")
+                || lower.contains("chatgpt.app")
                 || lower.contains("cursor")
                 || lower.contains("trae")
                 || isAntigravityDesktopProcess(lower)
@@ -43,18 +133,66 @@ public enum ProcessAndChatScanner {
                 || lower.contains("dsh") else {
                 continue
             }
-            let footprint = physicalFootprint(pid: pid) ?? (rssKB * 1024)
+
+            activeMatchedPIDs.insert(pid)
+
+            var ttyName: String?
+            if bsd.e_tdev != UInt32.max, bsd.e_tdev != 0,
+               let devPtr = devname(dev_t(bitPattern: bsd.e_tdev), S_IFCHR) {
+                let s = String(cString: devPtr)
+                if !s.isEmpty && s != "??" && s != "?" {
+                    ttyName = s
+                }
+            }
+
+            var taskInfo = proc_taskinfo()
+            let hasTaskInfo = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &taskInfo, taskStride) == taskStride
+            let cpuPercent: Double
+            if hasTaskInfo {
+                let totalTicks = taskInfo.pti_total_user &+ taskInfo.pti_total_system
+                cpuPercent = sampleCPUPercent(pid: pid, totalTicks: totalTicks, nowUptimeNs: nowUptimeNs)
+            } else {
+                cpuPercent = 0.0
+            }
+
+            let fallbackRSS = hasTaskInfo ? taskInfo.pti_resident_size : 0
+            let footprint = physicalFootprint(pid: pid) ?? fallbackRSS
             let cwd = processWorkingDirectory(pid: pid)
             results.append(ProcessStats(
                 pid: pid,
                 memoryBytes: footprint,
-                cpuPercent: cpu,
-                tty: (tty == "??" || tty == "?") ? nil : tty,
+                cpuPercent: cpuPercent,
+                tty: ttyName,
                 cwd: cwd,
                 command: comm
             ))
         }
+
+        cpuLock.lock()
+        prevCPUSamples = prevCPUSamples.filter { activeMatchedPIDs.contains($0.key) }
+        cpuLock.unlock()
+
         return results
+    }
+
+    private static func sampleCPUPercent(pid: Int32, totalTicks: UInt64, nowUptimeNs: UInt64) -> Double {
+        cpuLock.lock()
+        defer { cpuLock.unlock() }
+        if let prev = prevCPUSamples[pid] {
+            let wallDeltaNs = nowUptimeNs > prev.uptimeNs ? (nowUptimeNs - prev.uptimeNs) : 0
+            if wallDeltaNs < 250_000_000 {
+                return prev.lastPercent
+            }
+            let tickDelta = totalTicks >= prev.totalMachTicks ? (totalTicks - prev.totalMachTicks) : 0
+            let cpuNs = Double(tickDelta) * timebaseNumerDenom.numer / timebaseNumerDenom.denom
+            let rawPct = max(0.0, (cpuNs / Double(wallDeltaNs)) * 100.0)
+            let rounded = (rawPct * 10.0).rounded() / 10.0
+            prevCPUSamples[pid] = CPUSample(totalMachTicks: totalTicks, uptimeNs: nowUptimeNs, lastPercent: rounded)
+            return rounded
+        } else {
+            prevCPUSamples[pid] = CPUSample(totalMachTicks: totalTicks, uptimeNs: nowUptimeNs, lastPercent: 0.0)
+            return 0.0
+        }
     }
 
     public static func physicalFootprint(pid: Int32) -> UInt64? {
@@ -82,35 +220,39 @@ public enum ProcessAndChatScanner {
     }
 
     public static func attachProcesses(to sessions: inout [AgentSession], processes: [ProcessStats]) {
+        guard !processes.isEmpty else { return }
+        let prepared: [(proc: ProcessStats, lowerCmd: String)] = processes.map { ($0, $0.command.lowercased()) }
         for idx in sessions.indices where sessions[idx].host.isLocal {
             let kind = sessions[idx].kind
             let targetCwd = sessions[idx].cwd
-            let matched = processes.filter { proc in
-                let cmd = proc.command.lowercased()
+            let matched = prepared.compactMap { entry -> ProcessStats? in
+                let cmd = entry.lowerCmd
+                let ok: Bool
                 switch kind {
                 case .claudeCode:
-                    return cmd.hasSuffix("/claude") || cmd == "claude"
+                    ok = cmd.hasSuffix("/claude") || cmd == "claude"
                 case .claudeDesktop:
-                    return cmd.contains("claude.app")
+                    ok = cmd.contains("claude.app")
                 case .codexCLI:
-                    return (cmd.hasSuffix("/codex") || cmd == "codex") && !cmd.contains("chatgpt.app/contents/macos/chatgpt")
+                    ok = (cmd.hasSuffix("/codex") || cmd == "codex") && !cmd.contains("chatgpt.app/contents/macos/chatgpt")
                 case .codexDesktop:
-                    return cmd.contains("chatgpt.app") || cmd.contains("codex")
+                    ok = cmd.contains("chatgpt.app") || cmd.contains("codex")
                 case .deepseekHarness:
-                    return cmd.contains("deepseek harness.app") || cmd.contains("dsh")
+                    ok = cmd.contains("deepseek harness.app") || cmd.contains("dsh")
                 case .cursor:
-                    return cmd.contains("cursor.app/contents/macos/cursor")
+                    ok = cmd.contains("cursor.app/contents/macos/cursor")
                 case .trae:
-                    return cmd.contains("trae")
+                    ok = cmd.contains("trae")
                 case .antigravity:
-                    return isAntigravityDesktopProcess(cmd)
+                    ok = isAntigravityDesktopProcess(cmd)
                 case .doubao:
-                    return cmd.contains("doubao")
+                    ok = cmd.contains("doubao")
                 case .deepseekChat:
-                    return cmd.contains("deepseek.app")
+                    ok = cmd.contains("deepseek.app")
                 case .generic:
-                    return false
+                    ok = false
                 }
+                return ok ? entry.proc : nil
             }
             if let exactCwdMatch = matched.first(where: { proc in
                 guard let pcwd = proc.cwd, let scwd = targetCwd else { return false }

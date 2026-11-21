@@ -3,6 +3,9 @@ import Foundation
 import SQLite3
 
 public enum AntigravityAdapter {
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var summariesCache: [String: (dbStat: FastJSONL.FileStatKey, walStat: FastJSONL.FileStatKey?, sessions: [AgentSession])] = [:]
+
     public static func loadLocalSessions(
         homeDirectory: String = NSHomeDirectory(),
         lookbackHours: Double = 96,
@@ -10,12 +13,40 @@ public enum AntigravityAdapter {
     ) async -> [AgentSession] {
         let path = (homeDirectory as NSString)
             .appendingPathComponent(".gemini/antigravity/conversation_summaries.db")
+        guard let dbStat = FastJSONL.statKey(atPath: path) else { return [] }
+        let walStat = FastJSONL.statKey(atPath: path + "-wal")
         let cutoff = Date().addingTimeInterval(-lookbackHours * 3600)
-        var sessions = readSummaries(at: path, since: cutoff, seenAtByID: seenAtByID)
-        for index in sessions.indices {
-            sessions[index].groupDirectory = await GitRootResolver.shared.resolveGroupDirectory(for: sessions[index].cwd)
+
+        let cachedSessions: [AgentSession]? = cacheLock.withLock {
+            guard let hit = summariesCache[path], hit.dbStat == dbStat, hit.walStat == walStat else {
+                return nil
+            }
+            return hit.sessions
         }
-        return sessions
+        let baseSessions: [AgentSession]
+        if let cachedSessions {
+            baseSessions = cachedSessions
+        } else {
+            var parsed = readSummaries(at: path, since: .distantPast, seenAtByID: [:])
+            for index in parsed.indices {
+                parsed[index].groupDirectory = await GitRootResolver.shared.resolveGroupDirectory(for: parsed[index].cwd)
+            }
+            cacheLock.withLock {
+                summariesCache[path] = (dbStat, walStat, parsed)
+            }
+            baseSessions = parsed
+        }
+
+        return baseSessions.compactMap { item in
+            guard item.lastActivityAt >= cutoff else { return nil }
+            var copy = item
+            copy.isSeen = SeenSessionLookup.isSeen(
+                sessionID: copy.id,
+                lastActivityAt: copy.lastActivityAt,
+                seenAtByID: seenAtByID
+            )
+            return copy
+        }
     }
 
     public static func loadLocalSessions(
@@ -31,12 +62,19 @@ public enum AntigravityAdapter {
     @MainActor
     public static func runningDesktopSession(processes: [ProcessStats]) -> AgentSession? {
         let kind = AgentKind.antigravity
-        guard let app = NSWorkspace.shared.runningApplications.first(where: {
-            guard let bundleID = $0.bundleIdentifier else { return false }
-            return kind.preferredBundleIdentifiers.contains(bundleID) && !$0.isTerminated
-        }) else { return nil }
-
-        let launchedAt = app.launchDate ?? Date()
+        let matchedProc = processes.first { proc in
+            let lower = proc.command.lowercased()
+            return lower == "antigravity" || lower.hasSuffix("/antigravity.app/contents/macos/antigravity")
+        }
+        var runningApp: NSRunningApplication?
+        for bundleID in kind.preferredBundleIdentifiers {
+            if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first(where: { !$0.isTerminated }) {
+                runningApp = app
+                break
+            }
+        }
+        guard runningApp != nil || matchedProc != nil else { return nil }
+        let launchedAt = runningApp?.launchDate ?? Date()
         return AgentSession(
             id: "local:antigravity:desktop",
             rawSessionID: "desktop",
@@ -44,7 +82,7 @@ public enum AntigravityAdapter {
             title: kind.displayName,
             overview: "桌面应用运行中 · 暂无近期会话摘要",
             status: .runningProcessOnly,
-            process: processes.first { $0.pid == app.processIdentifier },
+            process: runningApp.flatMap { app in processes.first { $0.pid == app.processIdentifier } } ?? matchedProc,
             startedAt: launchedAt,
             lastActivityAt: launchedAt,
             isSeen: true

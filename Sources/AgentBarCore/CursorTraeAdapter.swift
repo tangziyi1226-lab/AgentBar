@@ -2,6 +2,42 @@ import Foundation
 import SQLite3
 
 public enum CursorTraeAdapter {
+    private struct ComposerCore {
+        var baseSession: AgentSession
+        var isGenerating: Bool
+        var hasHeaders: Bool
+
+        func materialize(seenAtByID: [String: TimeInterval], now: Date) -> AgentSession {
+            var session = baseSession
+            let isSeen = SeenSessionLookup.isSeen(
+                sessionID: session.id,
+                lastActivityAt: session.lastActivityAt,
+                seenAtByID: seenAtByID
+            )
+            let status: SessionStatus
+            if isGenerating {
+                status = .generating
+            } else if !isSeen && now.timeIntervalSince(session.lastActivityAt) < 1800 && hasHeaders {
+                status = .completed
+            } else {
+                status = .waitingForInput
+            }
+            session.isSeen = isSeen
+            session.status = status
+            return session
+        }
+    }
+
+    private struct DBCacheEntry {
+        var dbStat: FastJSONL.FileStatKey
+        var walStat: FastJSONL.FileStatKey?
+        var wsStat: FastJSONL.FileStatKey?
+        var cores: [ComposerCore]
+    }
+
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var dbCache: [String: DBCacheEntry] = [:]
+
     public static func loadLocalSessions(
         homeDirectory: String = NSHomeDirectory(),
         lookbackHours: Double = 96,
@@ -71,10 +107,50 @@ public enum CursorTraeAdapter {
         lookbackHours: Double,
         seenAtByID: [String: TimeInterval]
     ) async -> [AgentSession] {
-        guard FileManager.default.fileExists(atPath: dbPath) else { return [] }
-        let fallbackWorkspace = readRecentWorkspaceFolder(root: workspaceStorageRoot)
-        let cutoff = Date().addingTimeInterval(-lookbackHours * 3600)
+        guard let dbStat = FastJSONL.statKey(atPath: dbPath) else { return [] }
+        let walStat = FastJSONL.statKey(atPath: dbPath + "-wal")
+        let wsStat = FastJSONL.statKey(atPath: workspaceStorageRoot)
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-lookbackHours * 3600)
 
+        let cachedCores: [ComposerCore]? = cacheLock.withLock {
+            guard let hit = dbCache[dbPath],
+                  hit.dbStat == dbStat,
+                  hit.walStat == walStat,
+                  hit.wsStat == wsStat else {
+                return nil
+            }
+            return hit.cores
+        }
+        let cores: [ComposerCore]
+        if let cachedCores {
+            cores = cachedCores
+        } else {
+            let fallbackWorkspace = readRecentWorkspaceFolder(root: workspaceStorageRoot)
+            let groupDir = await GitRootResolver.shared.resolveGroupDirectory(for: fallbackWorkspace)
+            let parsed = parseStateDBCores(
+                dbPath: dbPath,
+                fallbackWorkspace: fallbackWorkspace,
+                groupDir: groupDir,
+                kind: kind
+            )
+            cacheLock.withLock {
+                dbCache[dbPath] = DBCacheEntry(dbStat: dbStat, walStat: walStat, wsStat: wsStat, cores: parsed)
+            }
+            cores = parsed
+        }
+
+        return cores
+            .filter { $0.baseSession.lastActivityAt >= cutoff }
+            .map { $0.materialize(seenAtByID: seenAtByID, now: now) }
+    }
+
+    private static func parseStateDBCores(
+        dbPath: String,
+        fallbackWorkspace: String?,
+        groupDir: String?,
+        kind: AgentKind
+    ) -> [ComposerCore] {
         var db: OpaquePointer?
         let uri = "file:\(dbPath)?immutable=1"
         let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX
@@ -91,7 +167,7 @@ public enum CursorTraeAdapter {
         }
         defer { sqlite3_finalize(stmt) }
 
-        var sessions: [AgentSession] = []
+        var cores: [ComposerCore] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             guard let keyPtr = sqlite3_column_text(stmt, 0),
                   let valPtr = sqlite3_column_text(stmt, 1) else {
@@ -99,9 +175,10 @@ public enum CursorTraeAdapter {
             }
             let key = String(cString: keyPtr)
             if key.hasSuffix("empty-state-draft") { continue }
-            let jsonStr = String(cString: valPtr)
-            guard let data = jsonStr.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            let valBytes = Int(sqlite3_column_bytes(stmt, 1))
+            guard valBytes > 2 else { continue }
+            let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: valPtr), count: valBytes, deallocator: .none)
+            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 continue
             }
             let rawID = (obj["composerId"] as? String) ?? String(key.dropFirst("composerData:".count))
@@ -117,7 +194,6 @@ public enum CursorTraeAdapter {
             let updatedAt = updatedMs > 0
                 ? Date(timeIntervalSince1970: updatedMs / 1000.0)
                 : Date()
-            if updatedAt < cutoff { continue }
 
             var modelName: String?
             if let mc = obj["modelConfig"] as? [String: Any] {
@@ -126,35 +202,20 @@ public enum CursorTraeAdapter {
             let generatingBubbles = (obj["generatingBubbleIds"] as? [Any]) ?? []
             let rawStatus = (obj["status"] as? String) ?? "none"
             let sessionID = "local:\(kind.rawValue):\(rawID)"
-            let isSeen = SeenSessionLookup.isSeen(
-                sessionID: sessionID,
-                lastActivityAt: updatedAt,
-                seenAtByID: seenAtByID
-            )
-
-            let status: SessionStatus
-            if !generatingBubbles.isEmpty || rawStatus == "generating" {
-                status = .generating
-            } else if !isSeen && Date().timeIntervalSince(updatedAt) < 1800 && !headers.isEmpty {
-                status = .completed
-            } else {
-                status = .waitingForInput
-            }
 
             let title = (name?.isEmpty == false ? name! : nil)
                 ?? (textDraft?.isEmpty == false ? ClaudeCodeAdapter.firstSingleLine(textDraft!, maxLength: 40) : "\(kind.displayName) 会话")
             let subtitle = (obj["subtitle"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             let overview = (subtitle?.isEmpty == false ? subtitle! : "共 \(max(1, headers.count)) 条对话消息")
-            let groupDir = await GitRootResolver.shared.resolveGroupDirectory(for: fallbackWorkspace)
 
-            sessions.append(AgentSession(
+            let baseSession = AgentSession(
                 id: sessionID,
                 rawSessionID: rawID,
                 kind: kind,
                 host: .local,
                 title: title,
                 overview: overview,
-                status: status,
+                status: .waitingForInput,
                 cwd: fallbackWorkspace,
                 groupDirectory: groupDir,
                 provider: FormattingHelpers.providerDisplay(from: modelName),
@@ -163,9 +224,14 @@ public enum CursorTraeAdapter {
                 sourceFilePath: dbPath,
                 startedAt: createdMs > 0 ? Date(timeIntervalSince1970: createdMs / 1000.0) : updatedAt,
                 lastActivityAt: updatedAt,
-                isSeen: isSeen
+                isSeen: false
+            )
+            cores.append(ComposerCore(
+                baseSession: baseSession,
+                isGenerating: !generatingBubbles.isEmpty || rawStatus == "generating",
+                hasHeaders: !headers.isEmpty
             ))
         }
-        return sessions
+        return cores
     }
 }
