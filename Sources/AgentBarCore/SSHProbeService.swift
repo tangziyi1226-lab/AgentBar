@@ -292,9 +292,15 @@ public enum SSHProbeService {
         buildPosixProbeScript(includeSubagents: false)
     }
 
-    public static func buildPosixProbeScript(includeSubagents: Bool = false) -> String {
+    public static func buildPosixProbeScript(
+        includeSubagents: Bool = false,
+        dayCutoff: Date = Calendar.current.startOfDay(for: Date())
+    ) -> String {
         let subFlag = includeSubagents ? "1" : "0"
-        return "include_subagents=\(subFlag)\n" + #"""
+        let iso = ISO8601DateFormatter()
+        iso.timeZone = TimeZone(secondsFromGMT: 0)
+        let cutoffISO = iso.string(from: dayCutoff)
+        return "include_subagents=\(subFlag)\nday_cutoff_iso=\"\(cutoffISO)\"\n" + #"""
 printf "@@HOME %s\n" "$HOME"
 now_ts=$(date +%s 2>/dev/null || echo 0)
 
@@ -347,9 +353,12 @@ if [ -f "$HOME/.codex/session_index.jsonl" ]; then
   printf "\n@@END\n"
 fi
 
-if [ -d "$HOME/.codex/sessions" ]; then
+if [ -d "$HOME/.codex/sessions" ] || [ -d "$HOME/.codex/archived_sessions" ]; then
   codex_emitted=0
-  list_recent_files "$HOME/.codex/sessions" 'rollout-*.jsonl' 45 | while IFS= read -r f; do
+  {
+    [ -d "$HOME/.codex/sessions" ] && list_recent_files "$HOME/.codex/sessions" 'rollout-*.jsonl' 45
+    [ -d "$HOME/.codex/archived_sessions" ] && list_recent_files "$HOME/.codex/archived_sessions" 'rollout-*.jsonl' 20
+  } | while IFS= read -r f; do
     [ -n "$f" ] && [ -f "$f" ] || continue
     [ "$codex_emitted" -lt 24 ] || break
     if [ "$include_subagents" = "0" ]; then
@@ -366,6 +375,20 @@ if [ -d "$HOME/.codex/sessions" ]; then
       cat "$f" 2>/dev/null
     else
       head -n 10 "$f" 2>/dev/null
+      printf "\n"
+      grep -E '"type":"event_msg".*"type":"token_count"' "$f" 2>/dev/null | awk -v cut="$day_cutoff_iso" '
+        NR == 1 { first = $0 }
+        {
+          if (match($0, /"timestamp":"[^"]+"/)) {
+            ts = substr($0, RSTART + 13, RLENGTH - 14)
+            if (ts < cut) pre = $0
+          }
+        }
+        END {
+          if (first != "") print first
+          if (pre != "" && pre != first) print pre
+        }
+      ' 2>/dev/null
       printf "\n"
       grep -E '"type":"event_msg".*"type":"(task_started|task_complete|turn_aborted|error)"' "$f" 2>/dev/null | tail -n 3
       printf "\n"

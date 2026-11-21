@@ -242,10 +242,44 @@ public struct TokenUsage: Codable, Hashable, Sendable {
         input + output + cacheRead + cacheWrite
     }
 
+    public var uncachedInputOutputTokens: Int {
+        input + output
+    }
+
     public var cacheHitRate: Double? {
         let denom = input + cacheRead + cacheWrite
         guard denom > 0 else { return nil }
         return Double(cacheRead) / Double(denom)
+    }
+
+    public func adding(_ other: TokenUsage) -> TokenUsage {
+        TokenUsage(
+            input: input + other.input,
+            output: output + other.output,
+            cacheRead: cacheRead + other.cacheRead,
+            cacheWrite: cacheWrite + other.cacheWrite,
+            reasoning: reasoning + other.reasoning
+        )
+    }
+
+    public func subtractingClamped(_ baseline: TokenUsage) -> TokenUsage {
+        TokenUsage(
+            input: max(0, input - baseline.input),
+            output: max(0, output - baseline.output),
+            cacheRead: max(0, cacheRead - baseline.cacheRead),
+            cacheWrite: max(0, cacheWrite - baseline.cacheWrite),
+            reasoning: max(0, reasoning - baseline.reasoning)
+        )
+    }
+
+    public static func componentMax(_ lhs: TokenUsage, _ rhs: TokenUsage) -> TokenUsage {
+        TokenUsage(
+            input: max(lhs.input, rhs.input),
+            output: max(lhs.output, rhs.output),
+            cacheRead: max(lhs.cacheRead, rhs.cacheRead),
+            cacheWrite: max(lhs.cacheWrite, rhs.cacheWrite),
+            reasoning: max(lhs.reasoning, rhs.reasoning)
+        )
     }
 }
 
@@ -362,6 +396,12 @@ public struct AgentSession: Identifiable, Codable, Hashable, Sendable {
     public var model: String?
     public var reasoningEffort: String?
     public var usage: TokenUsage
+    public var todayUsage: TokenUsage?
+    public var modelUsages: [String: TokenUsage]?
+    public var todayModelUsages: [String: TokenUsage]?
+    public var isForkedCodex: Bool?
+    public var hasShardScopedToday: Bool?
+    public var mergedShardPaths: Set<String>?
     public var contextUsedTokens: Int?
     public var contextWindow: Int?
     public var currentTool: ToolCallRecord?
@@ -398,6 +438,12 @@ public struct AgentSession: Identifiable, Codable, Hashable, Sendable {
         model: String? = nil,
         reasoningEffort: String? = nil,
         usage: TokenUsage = TokenUsage(),
+        todayUsage: TokenUsage? = nil,
+        modelUsages: [String: TokenUsage]? = nil,
+        todayModelUsages: [String: TokenUsage]? = nil,
+        isForkedCodex: Bool? = nil,
+        hasShardScopedToday: Bool? = nil,
+        mergedShardPaths: Set<String>? = nil,
         contextUsedTokens: Int? = nil,
         contextWindow: Int? = nil,
         currentTool: ToolCallRecord? = nil,
@@ -432,6 +478,12 @@ public struct AgentSession: Identifiable, Codable, Hashable, Sendable {
         self.model = model
         self.reasoningEffort = reasoningEffort
         self.usage = usage
+        self.todayUsage = todayUsage
+        self.modelUsages = modelUsages
+        self.todayModelUsages = todayModelUsages
+        self.isForkedCodex = isForkedCodex
+        self.hasShardScopedToday = hasShardScopedToday
+        self.mergedShardPaths = mergedShardPaths
         self.contextUsedTokens = contextUsedTokens
         self.contextWindow = contextWindow
         self.currentTool = currentTool
@@ -455,6 +507,58 @@ public struct AgentSession: Identifiable, Codable, Hashable, Sendable {
 
     public var seenBaselineAt: Date {
         lastGeneratedAt ?? lastActivityAt
+    }
+
+    public func effectiveTodayUsage(
+        dayCutoff: Date = Calendar.current.startOfDay(for: Date()),
+        demoMode: Bool = false
+    ) -> TokenUsage {
+        if demoMode {
+            return usage
+        }
+        if let todayUsage {
+            return todayUsage
+        }
+        return lastActivityAt >= dayCutoff ? usage : TokenUsage()
+    }
+
+    public mutating func rollUpChildUsage(
+        _ child: AgentSession,
+        dayCutoff: Date = Calendar.current.startOfDay(for: Date())
+    ) {
+        guard child.usage.totalTokens > 0 else { return }
+        let parentToday = effectiveTodayUsage(dayCutoff: dayCutoff)
+        let childToday = child.effectiveTodayUsage(dayCutoff: dayCutoff)
+
+        let seededParentModels: [String: TokenUsage]? = {
+            if let modelUsages, !modelUsages.isEmpty { return modelUsages }
+            if let m = model, !m.isEmpty, usage.totalTokens > 0 { return [m: usage] }
+            return nil
+        }()
+        let seededChildModels: [String: TokenUsage]? = {
+            if let mMap = child.modelUsages, !mMap.isEmpty { return mMap }
+            if let m = child.model, !m.isEmpty, child.usage.totalTokens > 0 { return [m: child.usage] }
+            return nil
+        }()
+        let seededParentTodayModels: [String: TokenUsage]? = {
+            if let todayModelUsages, !todayModelUsages.isEmpty { return todayModelUsages }
+            if let m = model, !m.isEmpty, parentToday.totalTokens > 0 { return [m: parentToday] }
+            return nil
+        }()
+        let seededChildTodayModels: [String: TokenUsage]? = {
+            if let mMap = child.todayModelUsages, !mMap.isEmpty { return mMap }
+            if let m = child.model, !m.isEmpty, childToday.totalTokens > 0 { return [m: childToday] }
+            return nil
+        }()
+
+        usage = usage.adding(child.usage)
+        todayUsage = parentToday.adding(childToday)
+        modelUsages = SessionDeduplicator.mergeModelUsageMaps(seededParentModels, seededChildModels, additive: true)
+        todayModelUsages = SessionDeduplicator.mergeModelUsageMaps(
+            seededParentTodayModels,
+            seededChildTodayModels,
+            additive: true
+        )
     }
 
     public var contextRatio: Double? {
@@ -796,11 +900,6 @@ public enum SessionDeduplicator {
             out.overview = older.overview
         }
 
-        // Codex rollout shards record thread-cumulative `total_token_usage`; never sum shards.
-        if older.usage.totalTokens > newer.usage.totalTokens {
-            out.usage = older.usage
-        }
-
         if out.cwd == nil { out.cwd = older.cwd }
         if out.groupDirectory == nil { out.groupDirectory = older.groupDirectory }
         if out.model == nil { out.model = older.model }
@@ -812,12 +911,62 @@ public enum SessionDeduplicator {
         if out.process == nil { out.process = older.process }
         if out.pendingApproval == nil { out.pendingApproval = older.pendingApproval }
 
-        let isDistinctShardFile: Bool = {
-            guard let p1 = newer.sourceFilePath, let p2 = older.sourceFilePath, !p1.isEmpty, !p2.isEmpty else {
-                return false
-            }
-            return p1 != p2
+        let newerShards: Set<String> = {
+            if let set = newer.mergedShardPaths, !set.isEmpty { return set }
+            if let p = newer.sourceFilePath, !p.isEmpty { return [p] }
+            return []
         }()
+        let olderShards: Set<String> = {
+            if let set = older.mergedShardPaths, !set.isEmpty { return set }
+            if let p = older.sourceFilePath, !p.isEmpty { return [p] }
+            return []
+        }()
+        let isDistinctShardFile = !newerShards.isEmpty && !olderShards.isEmpty && newerShards.isDisjoint(with: olderShards)
+        let combinedShards = newerShards.union(olderShards)
+        if !combinedShards.isEmpty {
+            out.mergedShardPaths = combinedShards
+        }
+
+        let isForked = (newer.isForkedCodex == true) || (older.isForkedCodex == true)
+        out.isForkedCodex = isForked ? true : (newer.isForkedCodex ?? older.isForkedCodex)
+        let shardScoped = (newer.hasShardScopedToday == true) || (older.hasShardScopedToday == true)
+        out.hasShardScopedToday = shardScoped ? true : (newer.hasShardScopedToday ?? older.hasShardScopedToday)
+        let bothShardScoped = (newer.isForkedCodex == true || newer.hasShardScopedToday == true)
+            && (older.isForkedCodex == true || older.hasShardScopedToday == true)
+
+        if isDistinctShardFile && bothShardScoped {
+            out.usage = newer.usage.adding(older.usage)
+            if newer.todayUsage != nil || older.todayUsage != nil {
+                out.todayUsage = (newer.todayUsage ?? TokenUsage()).adding(older.todayUsage ?? TokenUsage())
+            }
+            out.modelUsages = mergeModelUsageMaps(newer.modelUsages, older.modelUsages, additive: true)
+            out.todayModelUsages = mergeModelUsageMaps(newer.todayModelUsages, older.todayModelUsages, additive: true)
+        } else {
+            // Non-forked Codex rollout shards record thread-cumulative `total_token_usage`; never sum shards.
+            var mergedUsage = older.usage.totalTokens > newer.usage.totalTokens ? older.usage : newer.usage
+            if isDistinctShardFile, (newer.todayUsage != nil || older.todayUsage != nil) {
+                if shardScoped {
+                    let summedToday = (newer.todayUsage ?? TokenUsage()).adding(older.todayUsage ?? TokenUsage())
+                    out.todayUsage = summedToday
+                    mergedUsage = TokenUsage.componentMax(mergedUsage, summedToday)
+                } else {
+                    let newerPreToday = newer.usage.subtractingClamped(newer.todayUsage ?? TokenUsage())
+                    let olderPreToday = older.usage.subtractingClamped(older.todayUsage ?? TokenUsage())
+                    let combinedPreToday = TokenUsage.componentMax(newerPreToday, olderPreToday)
+                    out.todayUsage = mergedUsage.subtractingClamped(combinedPreToday)
+                }
+            } else if out.todayUsage == nil {
+                out.todayUsage = older.todayUsage
+            }
+            let additiveModels = isDistinctShardFile && shardScoped
+            out.modelUsages = mergeModelUsageMaps(newer.modelUsages, older.modelUsages, additive: additiveModels)
+            out.todayModelUsages = mergeModelUsageMaps(newer.todayModelUsages, older.todayModelUsages, additive: additiveModels)
+            if let perModel = out.modelUsages, !perModel.isEmpty {
+                let sumModels = perModel.values.reduce(TokenUsage()) { $0.adding($1) }
+                mergedUsage = TokenUsage.componentMax(mergedUsage, sumModels)
+            }
+            out.usage = mergedUsage
+        }
 
         if isDistinctShardFile {
             out.turnCount = newer.turnCount + older.turnCount
@@ -834,6 +983,25 @@ public enum SessionDeduplicator {
         }
 
         return out
+    }
+
+    static func mergeModelUsageMaps(
+        _ primary: [String: TokenUsage]?,
+        _ secondary: [String: TokenUsage]?,
+        additive: Bool
+    ) -> [String: TokenUsage]? {
+        guard primary != nil || secondary != nil else { return nil }
+        var result = primary ?? [:]
+        for (modelKey, secUsage) in (secondary ?? [:]) {
+            if let existing = result[modelKey] {
+                result[modelKey] = additive
+                    ? existing.adding(secUsage)
+                    : TokenUsage.componentMax(existing, secUsage)
+            } else {
+                result[modelKey] = secUsage
+            }
+        }
+        return result.isEmpty ? nil : result
     }
 
     private static func isGenericFallbackTitle(_ title: String) -> Bool {

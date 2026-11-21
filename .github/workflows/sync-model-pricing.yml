@@ -1,0 +1,51 @@
+name: Sync Bundled Model Pricing
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-pricing:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch latest public model pricing catalog
+        run: python3 scripts/sync_pricing.py --output Resources/default-pricing.json
+
+      - name: Open or update PR when pricing changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git diff --quiet Resources/default-pricing.json; then
+            echo "No pricing changes detected."
+            exit 0
+          fi
+          BRANCH="chore/auto-sync-model-pricing"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add Resources/default-pricing.json
+          git commit -m "chore(pricing): sync bundled default-pricing.json from models.dev"
+          git push --force origin "$BRANCH"
+          EXISTING_PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$EXISTING_PR" ]; then
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore(pricing): 自动同步最新模型价格与上下文窗口快照" \
+              --body "由定时任务自动从 \`models.dev/api.json\` 更新离线兜底价格快照 \`Resources/default-pricing.json\`。"
+          else
+            echo "Updated existing PR #$EXISTING_PR"
+          fi

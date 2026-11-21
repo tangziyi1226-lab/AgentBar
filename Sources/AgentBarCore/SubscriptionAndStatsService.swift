@@ -108,19 +108,22 @@ public enum SubscriptionAndStatsService {
     ) -> [SubscriptionCardItem] {
         let uniqueSessions = SessionDeduplicator.deduplicate(sessions)
         let dayCutoff = Calendar.current.startOfDay(for: Date())
-        let todaySessions = uniqueSessions.filter { $0.lastActivityAt >= dayCutoff }
+        let todaySessions = uniqueSessions.filter {
+            $0.lastActivityAt >= dayCutoff || $0.effectiveTodayUsage(dayCutoff: dayCutoff).totalTokens > 0
+        }
         var items: [SubscriptionCardItem] = []
 
-        if let codexCard = detectCodexSubscription(homeDirectory: homeDirectory, todaySessions: todaySessions) {
+        if let codexCard = detectCodexSubscription(homeDirectory: homeDirectory, todaySessions: todaySessions, dayCutoff: dayCutoff) {
             items.append(codexCard)
         }
-        if let claudeCard = detectClaudeSubscription(homeDirectory: homeDirectory, todaySessions: todaySessions) {
+        if let claudeCard = detectClaudeSubscription(homeDirectory: homeDirectory, todaySessions: todaySessions, dayCutoff: dayCutoff) {
             items.append(claudeCard)
         }
         if let dshCard = detectDeepSeekSubscription(
             homeDirectory: homeDirectory,
             todaySessions: todaySessions,
-            account: deepSeekAccount
+            account: deepSeekAccount,
+            dayCutoff: dayCutoff
         ) {
             items.append(dshCard)
         }
@@ -152,7 +155,8 @@ public enum SubscriptionAndStatsService {
 
     private static func detectCodexSubscription(
         homeDirectory: String,
-        todaySessions: [AgentSession]
+        todaySessions: [AgentSession],
+        dayCutoff: Date
     ) -> SubscriptionCardItem? {
         let authPath = (homeDirectory as NSString).appendingPathComponent(".codex/auth.json")
         var planBadge: String?
@@ -179,7 +183,7 @@ public enum SubscriptionAndStatsService {
         let quotas = readLatestCodexRateLimits(homeDirectory: homeDirectory)
         let codexTodayTokens = todaySessions
             .filter { $0.kind == .codexDesktop || $0.kind == .codexCLI }
-            .reduce(0) { $0 + $1.usage.totalTokens }
+            .reduce(0) { $0 + $1.effectiveTodayUsage(dayCutoff: dayCutoff).totalTokens }
 
         guard planBadge != nil || !quotas.isEmpty || codexTodayTokens > 0 else {
             return nil
@@ -258,7 +262,8 @@ public enum SubscriptionAndStatsService {
 
     private static func detectClaudeSubscription(
         homeDirectory: String,
-        todaySessions: [AgentSession]
+        todaySessions: [AgentSession],
+        dayCutoff: Date
     ) -> SubscriptionCardItem? {
         let claudeJSONPath = (homeDirectory as NSString).appendingPathComponent(".claude.json")
         let settingsPath = (homeDirectory as NSString).appendingPathComponent(".claude/settings.json")
@@ -298,7 +303,7 @@ public enum SubscriptionAndStatsService {
 
         let claudeTodayTokens = todaySessions
             .filter { $0.kind == .claudeCode || $0.kind == .claudeDesktop }
-            .reduce(0) { $0 + $1.usage.totalTokens }
+            .reduce(0) { $0 + $1.effectiveTodayUsage(dayCutoff: dayCutoff).totalTokens }
 
         guard planBadge != nil || configuredModel != nil || claudeTodayTokens > 0 else {
             return nil
@@ -329,7 +334,8 @@ public enum SubscriptionAndStatsService {
     private static func detectDeepSeekSubscription(
         homeDirectory: String,
         todaySessions: [AgentSession],
-        account: DeepSeekAccountSnapshot? = nil
+        account: DeepSeekAccountSnapshot? = nil,
+        dayCutoff: Date
     ) -> SubscriptionCardItem? {
         let dshDir = DeepSeekAccountUsageService.resolveDSHHome(homeDirectory: homeDirectory)
         var isDir: ObjCBool = false
@@ -337,7 +343,7 @@ public enum SubscriptionAndStatsService {
         let hasStoredCreds = DeepSeekAccountUsageService.hasStoredCredentials(homeDirectory: homeDirectory)
         let dshTodayTokens = todaySessions
             .filter { $0.kind == .deepseekHarness || $0.kind == .deepseekChat }
-            .reduce(0) { $0 + $1.usage.totalTokens }
+            .reduce(0) { $0 + $1.effectiveTodayUsage(dayCutoff: dayCutoff).totalTokens }
         guard exists || hasStoredCreds || dshTodayTokens > 0 || account != nil else { return nil }
 
         var planBadge = hasStoredCreds ? "DeepSeek 账号" : "API 计费"
@@ -420,9 +426,20 @@ public enum SubscriptionAndStatsService {
         var projBuckets: [String: (name: String, abbr: String, hostTitle: String, count: Int, tok: Int, cost: Double)] = [:]
 
         for s in uniqueSessions {
-            let sCost = PricingCatalog.estimatedCostUSD(usage: s.usage, model: s.model) ?? 0
-            let rule = PricingCatalog.rule(for: s.model)
-            if let rule, s.usage.cacheRead > 0 {
+            let sCost = PricingCatalog.estimatedCostUSD(for: s) ?? 0
+            if let perModel = s.modelUsages, !perModel.isEmpty {
+                var attributed = TokenUsage()
+                for (mName, mUsage) in perModel {
+                    attributed = attributed.adding(mUsage)
+                    if mUsage.cacheRead > 0, let mRule = PricingCatalog.rule(for: mName, provider: s.provider) {
+                        cacheSavings += (Double(mUsage.cacheRead) / 1_000_000.0) * max(0, mRule.inputPerMillionUSD - mRule.cacheReadPerMillionUSD)
+                    }
+                }
+                let rem = s.usage.subtractingClamped(attributed)
+                if rem.cacheRead > 0, let remRule = PricingCatalog.rule(for: s.model, provider: s.provider) {
+                    cacheSavings += (Double(rem.cacheRead) / 1_000_000.0) * max(0, remRule.inputPerMillionUSD - remRule.cacheReadPerMillionUSD)
+                }
+            } else if let rule = PricingCatalog.rule(for: s.model, provider: s.provider), s.usage.cacheRead > 0 {
                 let saved = (Double(s.usage.cacheRead) / 1_000_000.0) * max(0, rule.inputPerMillionUSD - rule.cacheReadPerMillionUSD)
                 cacheSavings += saved
             }
@@ -446,15 +463,12 @@ public enum SubscriptionAndStatsService {
                 activeCPU += proc.cpuPercent
             }
 
-            if demoMode || s.lastActivityAt >= dayCutoff {
+            let sToday = s.effectiveTodayUsage(dayCutoff: dayCutoff, demoMode: demoMode)
+            if demoMode || sToday.totalTokens > 0 || s.lastActivityAt >= dayCutoff {
                 todaySessionCount += 1
                 todayTurnCount += s.turnCount
-                todayCost += sCost
-                todayUsage.input += s.usage.input
-                todayUsage.output += s.usage.output
-                todayUsage.cacheRead += s.usage.cacheRead
-                todayUsage.cacheWrite += s.usage.cacheWrite
-                todayUsage.reasoning += s.usage.reasoning
+                todayCost += PricingCatalog.estimatedTodayCostUSD(for: s, dayCutoff: dayCutoff, demoMode: demoMode) ?? 0
+                todayUsage = todayUsage.adding(sToday)
             }
 
             var tb = toolBuckets[s.kind] ?? (0, 0, 0)
@@ -463,14 +477,26 @@ public enum SubscriptionAndStatsService {
             tb.cost += sCost
             toolBuckets[s.kind] = tb
 
-            if let rawModel = s.model, !rawModel.isEmpty {
+            if let perModel = s.modelUsages, !perModel.isEmpty {
+                var attributed = TokenUsage()
+                for (mName, mUsage) in perModel where !mName.isEmpty && mUsage.totalTokens > 0 {
+                    attributed = attributed.adding(mUsage)
+                    var mb = modelBuckets[mName] ?? (s.provider, 0, TokenUsage())
+                    mb.count += 1
+                    mb.usage = mb.usage.adding(mUsage)
+                    modelBuckets[mName] = mb
+                }
+                let rem = s.usage.subtractingClamped(attributed)
+                if rem.totalTokens > 0, let rawModel = s.model, !rawModel.isEmpty {
+                    var mb = modelBuckets[rawModel] ?? (s.provider, 0, TokenUsage())
+                    if perModel[rawModel] == nil { mb.count += 1 }
+                    mb.usage = mb.usage.adding(rem)
+                    modelBuckets[rawModel] = mb
+                }
+            } else if let rawModel = s.model, !rawModel.isEmpty {
                 var mb = modelBuckets[rawModel] ?? (s.provider, 0, TokenUsage())
                 mb.count += 1
-                mb.usage.input += s.usage.input
-                mb.usage.output += s.usage.output
-                mb.usage.cacheRead += s.usage.cacheRead
-                mb.usage.cacheWrite += s.usage.cacheWrite
-                mb.usage.reasoning += s.usage.reasoning
+                mb.usage = mb.usage.adding(s.usage)
                 modelBuckets[rawModel] = mb
             }
 

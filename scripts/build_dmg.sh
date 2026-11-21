@@ -28,6 +28,9 @@ rm -rf "$ICONSET_DIR"
 
 echo "==> [3/4] 组装并签名 AgentBar.app…"
 cp "$ROOT_DIR/Resources/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
+if [ -f "$ROOT_DIR/Resources/default-pricing.json" ]; then
+  cp "$ROOT_DIR/Resources/default-pricing.json" "$APP_BUNDLE/Contents/Resources/default-pricing.json"
+fi
 cp "$BIN_DIR/AgentBar" "$APP_BUNDLE/Contents/MacOS/AgentBar"
 cp "$BIN_DIR/agentbar-hook" "$APP_BUNDLE/Contents/MacOS/agentbar-hook"
 chmod +x "$APP_BUNDLE/Contents/MacOS/AgentBar" "$APP_BUNDLE/Contents/MacOS/agentbar-hook"

@@ -1,6 +1,17 @@
 import Foundation
 
 public enum ClaudeCodeAdapter {
+    private struct CachedTranscriptEntry {
+        var mtime: TimeInterval
+        var fileSize: Int
+        var dayCutoff: TimeInterval
+        var includeSubagents: Bool
+        var session: AgentSession?
+    }
+
+    private static let transcriptCacheLock = NSLock()
+    nonisolated(unsafe) private static var transcriptCache: [String: CachedTranscriptEntry] = [:]
+
     private static let fractionalISOStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     private static let basicISOStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: false)
 
@@ -38,39 +49,159 @@ public enum ClaudeCodeAdapter {
         let rootPath = (homeDirectory as NSString).appendingPathComponent(".claude/projects")
         let provider = detectLocalProvider(homeDirectory: homeDirectory)
         let cutoff = Date().addingTimeInterval(-lookbackHours * 3600)
-        let candidates = collectRecentJSONLFiles(
+        var collected = collectRecentJSONLFilesWithSubagents(
             rootPath: rootPath,
             cutoff: cutoff,
             includeSubagents: includeSubagents
         )
+        let desktopRoots = [
+            (homeDirectory as NSString).appendingPathComponent("Library/Application Support/Claude/local-agent-mode-sessions"),
+            (homeDirectory as NSString).appendingPathComponent("Library/Application Support/Claude-3p/local-agent-mode-sessions")
+        ]
+        for desktopRoot in desktopRoots {
+            let extra = collectClaudeDesktopLocalAgentFiles(
+                rootPath: desktopRoot,
+                cutoff: cutoff,
+                includeSubagents: includeSubagents
+            )
+            if !extra.mainFiles.isEmpty {
+                collected.mainFiles.append(contentsOf: extra.mainFiles)
+            }
+            if !extra.subagentFiles.isEmpty {
+                collected.subagentFiles.append(contentsOf: extra.subagentFiles)
+            }
+        }
+        collected.mainFiles.sort { $0.mtime > $1.mtime }
 
-        let maxUniqueSessions = 35
-        let maxCandidateScan = 200
+        let maxUniqueSessions = 1000
+        let maxCandidateScan = 2500
         var parsedSessions: [AgentSession] = []
         var acceptedIDs: Set<String> = []
+        let now = Date()
+        let dayCutoff = Calendar.current.startOfDay(for: now)
+        let dayCutoffTS = dayCutoff.timeIntervalSince1970
 
-        for item in candidates.prefix(maxCandidateScan) {
-            guard let content = try? String(contentsOf: item.url, encoding: .utf8) else { continue }
+        for item in collected.mainFiles.prefix(maxCandidateScan) {
+            let fileAge = now.timeIntervalSince(item.mtime)
+            let filePath = item.url.path
+            let fileSize = (try? item.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            let mtimeTS = item.mtime.timeIntervalSince1970
             let rawID = item.url.deletingPathExtension().lastPathComponent
-            if var session = parseTranscript(
-                jsonl: content,
-                fallbackSessionID: rawID,
-                filePath: item.url.path,
-                fileModificationDate: item.mtime,
-                host: .local,
-                defaultProvider: provider,
-                includeSubagents: includeSubagents,
-                seenAtByID: seenAtByID
-            ) {
+            let parsedOpt: AgentSession?
+            if fileAge > 1800,
+               let cached = lookupCachedTranscript(
+                   path: filePath,
+                   mtime: mtimeTS,
+                   size: fileSize,
+                   dayCutoff: dayCutoffTS,
+                   includeSubagents: includeSubagents
+               ) {
+                parsedOpt = cached
+            } else {
+                guard let content = try? String(contentsOf: item.url, encoding: .utf8) else { continue }
+                let fresh = parseTranscript(
+                    jsonl: content,
+                    fallbackSessionID: rawID,
+                    filePath: filePath,
+                    fileModificationDate: item.mtime,
+                    host: .local,
+                    defaultProvider: provider,
+                    includeSubagents: includeSubagents,
+                    seenAtByID: seenAtByID,
+                    dayCutoff: dayCutoff
+                )
+                if fileAge > 1800 {
+                    storeCachedTranscript(
+                        path: filePath,
+                        mtime: mtimeTS,
+                        size: fileSize,
+                        dayCutoff: dayCutoffTS,
+                        includeSubagents: includeSubagents,
+                        session: fresh
+                    )
+                }
+                parsedOpt = fresh
+            }
+
+            if var session = parsedOpt {
                 if !acceptedIDs.contains(session.id) {
-                    guard acceptedIDs.count < maxUniqueSessions else { continue }
+                    guard acceptedIDs.count < maxUniqueSessions || item.mtime >= dayCutoff else { continue }
                     acceptedIDs.insert(session.id)
                 }
                 session.groupDirectory = await GitRootResolver.shared.resolveGroupDirectory(for: session.cwd)
                 parsedSessions.append(session)
             }
         }
-        return SessionDeduplicator.deduplicate(parsedSessions)
+        var deduped = SessionDeduplicator.deduplicate(parsedSessions)
+        if !includeSubagents && !collected.subagentFiles.isEmpty {
+            let subsByParent = Dictionary(grouping: collected.subagentFiles.prefix(1000), by: \.parentSessionID)
+            for idx in deduped.indices {
+                guard let subItems = subsByParent[deduped[idx].rawSessionID] else { continue }
+                var subParsed: [AgentSession] = []
+                for subItem in subItems {
+                    guard let content = try? String(contentsOf: subItem.url, encoding: .utf8) else { continue }
+                    let fallbackID = subItem.url.deletingPathExtension().lastPathComponent
+                    if let subSession = parseTranscript(
+                        jsonl: content,
+                        fallbackSessionID: fallbackID,
+                        filePath: subItem.url.path,
+                        fileModificationDate: subItem.mtime,
+                        host: .local,
+                        defaultProvider: provider,
+                        includeSubagents: true,
+                        seenAtByID: seenAtByID,
+                        dayCutoff: dayCutoff
+                    ) {
+                        subParsed.append(subSession)
+                    }
+                }
+                for subSession in SessionDeduplicator.deduplicate(subParsed) {
+                    deduped[idx].rollUpChildUsage(subSession, dayCutoff: dayCutoff)
+                }
+            }
+        }
+        return deduped
+    }
+
+    private static func lookupCachedTranscript(
+        path: String,
+        mtime: TimeInterval,
+        size: Int,
+        dayCutoff: TimeInterval,
+        includeSubagents: Bool
+    ) -> AgentSession?? {
+        transcriptCacheLock.lock()
+        defer { transcriptCacheLock.unlock() }
+        guard let entry = transcriptCache[path],
+              entry.mtime == mtime,
+              entry.fileSize == size,
+              entry.dayCutoff == dayCutoff,
+              entry.includeSubagents == includeSubagents else {
+            return nil
+        }
+        return entry.session
+    }
+
+    private static func storeCachedTranscript(
+        path: String,
+        mtime: TimeInterval,
+        size: Int,
+        dayCutoff: TimeInterval,
+        includeSubagents: Bool,
+        session: AgentSession?
+    ) {
+        transcriptCacheLock.lock()
+        defer { transcriptCacheLock.unlock() }
+        if transcriptCache.count > 3000 {
+            transcriptCache.removeAll(keepingCapacity: true)
+        }
+        transcriptCache[path] = CachedTranscriptEntry(
+            mtime: mtime,
+            fileSize: size,
+            dayCutoff: dayCutoff,
+            includeSubagents: includeSubagents,
+            session: session
+        )
     }
 
     public static func collectRecentJSONLFiles(
@@ -78,29 +209,60 @@ public enum ClaudeCodeAdapter {
         cutoff: Date,
         includeSubagents: Bool = false
     ) -> [(url: URL, mtime: Date)] {
+        collectRecentJSONLFilesWithSubagents(
+            rootPath: rootPath,
+            cutoff: cutoff,
+            includeSubagents: includeSubagents
+        ).mainFiles
+    }
+
+    struct CollectedClaudeFiles {
+        var mainFiles: [(url: URL, mtime: Date)]
+        var subagentFiles: [(parentSessionID: String, url: URL, mtime: Date)]
+    }
+
+    static func collectRecentJSONLFilesWithSubagents(
+        rootPath: String,
+        cutoff: Date,
+        includeSubagents: Bool = false,
+        skipHiddenFiles: Bool = true,
+        requireProjectsSubpath: Bool = false
+    ) -> CollectedClaudeFiles {
         let fm = FileManager.default
+        let options: FileManager.DirectoryEnumerationOptions = skipHiddenFiles ? [.skipsHiddenFiles] : []
         guard fm.fileExists(atPath: rootPath),
               let enumerator = fm.enumerator(
                   at: URL(fileURLWithPath: rootPath),
                   includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
-                  options: [.skipsHiddenFiles]
+                  options: options
               ) else {
-            return []
+            return CollectedClaudeFiles(mainFiles: [], subagentFiles: [])
         }
         var candidates: [(url: URL, mtime: Date)] = []
+        var subagents: [(parentSessionID: String, url: URL, mtime: Date)] = []
         var subagentNewestByParentPath: [String: Date] = [:]
         while let obj = enumerator.nextObject() {
             guard let url = obj as? URL, url.pathExtension == "jsonl" else { continue }
+            let pathStr = url.path
+            if requireProjectsSubpath && !pathStr.contains("/.claude/projects/") {
+                continue
+            }
             let vals = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
             guard vals?.isRegularFile == true else { continue }
             let mtime = vals?.contentModificationDate ?? .distantPast
-            let pathStr = url.path
             if !includeSubagents, let subRange = pathStr.range(of: "/subagents/") {
-                let parentPrefix = String(pathStr[..<subRange.lowerBound]) + ".jsonl"
+                let parentDirPath = String(pathStr[..<subRange.lowerBound])
+                let parentPrefix = parentDirPath + ".jsonl"
                 if let prev = subagentNewestByParentPath[parentPrefix] {
                     if mtime > prev { subagentNewestByParentPath[parentPrefix] = mtime }
                 } else {
                     subagentNewestByParentPath[parentPrefix] = mtime
+                }
+                if mtime >= cutoff {
+                    let parentID = URL(fileURLWithPath: parentDirPath).lastPathComponent
+                    if !parentID.isEmpty {
+                        subagents.append((parentID, url, mtime))
+                    }
                 }
                 continue
             }
@@ -115,7 +277,22 @@ public enum ClaudeCodeAdapter {
             }
         }
         candidates.sort { $0.mtime > $1.mtime }
-        return candidates
+        subagents.sort { $0.mtime > $1.mtime }
+        return CollectedClaudeFiles(mainFiles: candidates, subagentFiles: subagents)
+    }
+
+    private static func collectClaudeDesktopLocalAgentFiles(
+        rootPath: String,
+        cutoff: Date,
+        includeSubagents: Bool
+    ) -> CollectedClaudeFiles {
+        collectRecentJSONLFilesWithSubagents(
+            rootPath: rootPath,
+            cutoff: cutoff,
+            includeSubagents: includeSubagents,
+            skipHiddenFiles: false,
+            requireProjectsSubpath: true
+        )
     }
 
     public static func parseTranscript(
@@ -126,8 +303,15 @@ public enum ClaudeCodeAdapter {
         host: HostID,
         defaultProvider: String = "Anthropic",
         includeSubagents: Bool = false,
-        seenAtByID: [String: TimeInterval] = [:]
+        seenAtByID: [String: TimeInterval] = [:],
+        dayCutoff: Date = Calendar.current.startOfDay(for: Date())
     ) -> AgentSession? {
+        struct MessageUsageEntry {
+            var usage: TokenUsage
+            var model: String?
+            var date: Date?
+        }
+
         var rawSessionID = fallbackSessionID
         var agentID: String?
         var sawSidechain = false
@@ -138,8 +322,8 @@ public enum ClaudeCodeAdapter {
         var lastUserPrompt: String?
         var cwd: String?
         var model: String?
-        var usageByMessageID: [String: TokenUsage] = [:]
-        var anonymousUsage = TokenUsage()
+        var usageByMessageID: [String: MessageUsageEntry] = [:]
+        var anonymousEntries: [MessageUsageEntry] = []
         var lastPromptTokens: Int?
         var openTools: [String: ToolCallRecord] = [:]
         var openToolOrder: [String] = []
@@ -264,8 +448,10 @@ public enum ClaudeCodeAdapter {
                 }
             case "assistant":
                 guard let msg = obj["message"] as? [String: Any] else { continue }
+                var msgModel: String?
                 if let m = msg["model"] as? String, !m.isEmpty, m != "<synthetic>" {
                     model = m
+                    msgModel = m
                 }
                 if let sr = msg["stop_reason"] as? String {
                     lastStopReason = sr
@@ -279,18 +465,27 @@ public enum ClaudeCodeAdapter {
                     )
                     lastPromptTokens = u.totalPromptTokens
                     if let msgID = msg["id"] as? String, !msgID.isEmpty {
-                        let prev = usageByMessageID[msgID] ?? TokenUsage()
-                        usageByMessageID[msgID] = TokenUsage(
-                            input: max(prev.input, u.input),
-                            output: max(prev.output, u.output),
-                            cacheRead: max(prev.cacheRead, u.cacheRead),
-                            cacheWrite: max(prev.cacheWrite, u.cacheWrite)
+                        let prev = usageByMessageID[msgID]
+                        let mergedUsage = TokenUsage.componentMax(prev?.usage ?? TokenUsage(), u)
+                        let mergedDate: Date? = {
+                            switch (prev?.date, eventDate) {
+                            case let (d1?, d2?): return max(d1, d2)
+                            case let (d1?, nil): return d1
+                            case let (nil, d2?): return d2
+                            case (nil, nil): return nil
+                            }
+                        }()
+                        usageByMessageID[msgID] = MessageUsageEntry(
+                            usage: mergedUsage,
+                            model: msgModel ?? prev?.model ?? model,
+                            date: mergedDate
                         )
                     } else {
-                        anonymousUsage.input += u.input
-                        anonymousUsage.output += u.output
-                        anonymousUsage.cacheRead += u.cacheRead
-                        anonymousUsage.cacheWrite += u.cacheWrite
+                        anonymousEntries.append(MessageUsageEntry(
+                            usage: u,
+                            model: msgModel ?? model,
+                            date: eventDate
+                        ))
                     }
                 }
 
@@ -349,7 +544,7 @@ public enum ClaudeCodeAdapter {
 
         let hasRealActivity = turnCount > 0
             || !usageByMessageID.isEmpty
-            || anonymousUsage.totalTokens > 0
+            || anonymousEntries.contains(where: { $0.usage.totalTokens > 0 })
             || lastAssistantText != nil
             || !openTools.isEmpty
             || lastEventKind == "api_request"
@@ -364,12 +559,24 @@ public enum ClaudeCodeAdapter {
             return nil
         }
 
-        var totalUsage = anonymousUsage
-        for (_, u) in usageByMessageID {
-            totalUsage.input += u.input
-            totalUsage.output += u.output
-            totalUsage.cacheRead += u.cacheRead
-            totalUsage.cacheWrite += u.cacheWrite
+        var totalUsage = TokenUsage()
+        var todayUsage = TokenUsage()
+        var modelUsages: [String: TokenUsage] = [:]
+        var todayModelUsages: [String: TokenUsage] = [:]
+
+        for entry in (Array(usageByMessageID.values) + anonymousEntries) where entry.usage.totalTokens > 0 {
+            totalUsage = totalUsage.adding(entry.usage)
+            let resolvedModel = entry.model ?? model
+            if let resolvedModel, !resolvedModel.isEmpty {
+                modelUsages[resolvedModel] = (modelUsages[resolvedModel] ?? TokenUsage()).adding(entry.usage)
+            }
+            let ts = entry.date ?? fileModificationDate
+            if ts >= dayCutoff {
+                todayUsage = todayUsage.adding(entry.usage)
+                if let resolvedModel, !resolvedModel.isEmpty {
+                    todayModelUsages[resolvedModel] = (todayModelUsages[resolvedModel] ?? TokenUsage()).adding(entry.usage)
+                }
+            }
         }
 
         let currentTool = openToolOrder.last.flatMap { openTools[$0] }
@@ -454,6 +661,9 @@ public enum ClaudeCodeAdapter {
             provider: resolvedProvider,
             model: model,
             usage: totalUsage,
+            todayUsage: todayUsage,
+            modelUsages: modelUsages.isEmpty ? nil : modelUsages,
+            todayModelUsages: todayModelUsages.isEmpty ? nil : todayModelUsages,
             contextUsedTokens: lastPromptTokens,
             contextWindow: contextWindow,
             currentTool: currentTool,

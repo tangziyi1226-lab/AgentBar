@@ -18,6 +18,16 @@ public enum AntigravityAdapter {
         return sessions
     }
 
+    public static func loadLocalSessions(
+        homeDirectory: String = NSHomeDirectory(),
+        lookbackHours: Double = 96,
+        seenSessionIDs: Set<String>
+    ) async -> [AgentSession] {
+        let futureTS = Date().addingTimeInterval(60).timeIntervalSince1970
+        let seenMap = Dictionary(uniqueKeysWithValues: seenSessionIDs.map { ($0, futureTS) })
+        return await loadLocalSessions(homeDirectory: homeDirectory, lookbackHours: lookbackHours, seenAtByID: seenMap)
+    }
+
     @MainActor
     public static func runningDesktopSession(processes: [ProcessStats]) -> AgentSession? {
         let kind = AgentKind.antigravity

@@ -179,17 +179,18 @@ struct OverviewDashboardView: View {
 
     private func todayHeroCard(_ stats: TotalAnalyticsSnapshot) -> some View {
         let hitText = stats.todayUsage.cacheHitRate.map { String(format: "%.0f%%", $0 * 100.0) } ?? "—"
+        let netIO = FormattingHelpers.compactTokens(stats.todayUsage.uncachedInputOutputTokens)
         return VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("今日消耗总览")
+                    Text("今日消耗总览（净输入+输出 \(netIO)）")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.secondary)
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text(FormattingHelpers.compactTokens(stats.todayUsage.totalTokens))
                             .font(.system(size: 23, weight: .bold, design: .rounded))
                             .monospacedDigit()
-                        Text("tokens")
+                        Text("tokens（含缓存）")
                             .font(.system(size: 11.5, weight: .medium))
                             .foregroundStyle(.secondary)
                     }
@@ -209,7 +210,12 @@ struct OverviewDashboardView: View {
                 miniStatPill(label: "输入", value: FormattingHelpers.compactTokens(stats.todayUsage.input))
                 miniStatPill(label: "输出", value: FormattingHelpers.compactTokens(stats.todayUsage.output))
                 miniStatPill(label: "缓存读", value: FormattingHelpers.compactTokens(stats.todayUsage.cacheRead))
-                miniStatPill(label: "推理", value: FormattingHelpers.compactTokens(stats.todayUsage.reasoning))
+                miniStatPill(
+                    label: stats.todayUsage.cacheWrite > 0 ? "缓存写" : "推理",
+                    value: FormattingHelpers.compactTokens(
+                        stats.todayUsage.cacheWrite > 0 ? stats.todayUsage.cacheWrite : stats.todayUsage.reasoning
+                    )
+                )
             }
         }
         .padding(11)
@@ -241,7 +247,12 @@ struct OverviewDashboardView: View {
             kpiTile(
                 title: "窗口期累计 Token",
                 value: FormattingHelpers.compactTokens(stats.allUsage.totalTokens),
-                subtitle: String(format: "%d 个会话 · 累计预估 $%.2f", stats.allSessionCount, stats.allCostUSD)
+                subtitle: String(
+                    format: "净 %@ · %d 会话 · $%.2f",
+                    FormattingHelpers.compactTokens(stats.allUsage.uncachedInputOutputTokens),
+                    stats.allSessionCount,
+                    stats.allCostUSD
+                )
             )
             kpiTile(
                 title: "Prompt 缓存节省",

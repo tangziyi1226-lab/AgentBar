@@ -91,6 +91,31 @@ final class AppModel {
         }
     }
 
+    var autoSyncPricingEnabled: Bool = true {
+        didSet {
+            UserDefaults.standard.set(autoSyncPricingEnabled, forKey: "autoSyncPricingEnabled")
+            if autoSyncPricingEnabled {
+                Task { await syncModelPricingIfNeeded() }
+            }
+        }
+    }
+
+    var customPriceRules: [ModelPriceRule] = PricingCatalog.customOverrideRules {
+        didSet {
+            PricingCatalog.customOverrideRules = customPriceRules
+            pricingRevision &+= 1
+        }
+    }
+
+    var pricingSyncStatus: PricingSyncStatus = PricingCatalog.currentSyncStatus
+    var isSyncingPricing: Bool = false
+    var pricingRevision: Int = 0
+    var newPricePrefixDraft: String = ""
+    var newPriceInputDraft: String = "0"
+    var newPriceOutputDraft: String = "0"
+    var newPriceCacheReadDraft: String = "0"
+    var newPriceCacheWriteDraft: String = "0"
+
     var sshHosts: [SSHHostConfig] = [] {
         didSet { saveCodable(sshHosts, key: "sshHosts") }
     }
@@ -130,6 +155,7 @@ final class AppModel {
     private var localPollTask: Task<Void, Never>?
     private var sshPollTask: Task<Void, Never>?
     private var balancePollTask: Task<Void, Never>?
+    private var pricingSyncTask: Task<Void, Never>?
     private var viewDetectorTask: Task<Void, Never>?
     private var lastSSHProbeAt: Date?
     private let viewDetector = ActiveSessionViewDetector()
@@ -166,7 +192,8 @@ final class AppModel {
     }
 
     var totalAnalytics: TotalAnalyticsSnapshot {
-        SubscriptionAndStatsService.buildAnalytics(
+        _ = pricingRevision
+        return SubscriptionAndStatsService.buildAnalytics(
             sessions: sessions,
             demoMode: demoModeEnabled,
             homeByHost: remoteHomes
@@ -384,27 +411,90 @@ final class AppModel {
     }
 
     var todaySummaryText: String {
+        _ = pricingRevision
         let dayCutoff = Calendar.current.startOfDay(for: Date())
         let uniqueSessions = SessionDeduplicator.deduplicate(sessions)
-        let recent = uniqueSessions.filter { $0.lastActivityAt >= dayCutoff || demoModeEnabled }
         var totalTok = 0
+        var netIOTok = 0
         var totalPrompt = 0
         var totalCacheRead = 0
         var totalCost = 0.0
-        for s in recent {
-            totalTok += s.usage.totalTokens
-            totalPrompt += s.usage.totalPromptTokens
-            totalCacheRead += s.usage.cacheRead
-            if let cost = PricingCatalog.estimatedCostUSD(usage: s.usage, model: s.model) {
+        for s in uniqueSessions {
+            let u = s.effectiveTodayUsage(dayCutoff: dayCutoff, demoMode: demoModeEnabled)
+            guard u.totalTokens > 0 else { continue }
+            totalTok += u.totalTokens
+            netIOTok += u.uncachedInputOutputTokens
+            totalPrompt += u.totalPromptTokens
+            totalCacheRead += u.cacheRead
+            if let cost = PricingCatalog.estimatedTodayCostUSD(
+                for: s,
+                dayCutoff: dayCutoff,
+                demoMode: demoModeEnabled
+            ) {
                 totalCost += cost
             }
         }
         let tokStr = FormattingHelpers.compactTokens(totalTok)
+        let netStr = FormattingHelpers.compactTokens(netIOTok)
         let hitStr = totalPrompt > 0
             ? String(format: "%.0f%%", (Double(totalCacheRead) / Double(totalPrompt)) * 100.0)
             : "—"
         let costStr = String(format: "$%.2f", totalCost)
-        return "今日 \(tokStr) tokens · 缓存命中 \(hitStr) · 预估 \(costStr)"
+        return "今日 \(tokStr) tokens (净 \(netStr)) · 缓存 \(hitStr) · 预估 \(costStr)"
+    }
+
+    var todaySummaryTooltip: String {
+        let u = totalAnalytics.todayUsage
+        return String(
+            format: "含缓存总计：%@ tokens\n净输入+输出（同网关口径）：%@（输入 %@ · 输出 %@）\n缓存读：%@ · 缓存写：%@\n今日预估 API 等值费用：$%.2f",
+            FormattingHelpers.compactTokens(u.totalTokens),
+            FormattingHelpers.compactTokens(u.uncachedInputOutputTokens),
+            FormattingHelpers.compactTokens(u.input),
+            FormattingHelpers.compactTokens(u.output),
+            FormattingHelpers.compactTokens(u.cacheRead),
+            FormattingHelpers.compactTokens(u.cacheWrite),
+            totalAnalytics.todayCostUSD
+        )
+    }
+
+    func syncModelPricingNow() async {
+        guard !isSyncingPricing else { return }
+        isSyncingPricing = true
+        defer { isSyncingPricing = false }
+        let status = await PricingCatalogSyncService.syncNow()
+        pricingSyncStatus = status
+        pricingRevision &+= 1
+    }
+
+    func syncModelPricingIfNeeded() async {
+        guard autoSyncPricingEnabled, !isSyncingPricing else { return }
+        isSyncingPricing = true
+        defer { isSyncingPricing = false }
+        let status = await PricingCatalogSyncService.syncIfNeeded(maxAgeHours: 24)
+        pricingSyncStatus = status
+        pricingRevision &+= 1
+    }
+
+    func addCustomPriceRuleFromDraft() {
+        let prefix = newPricePrefixDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prefix.isEmpty else { return }
+        let inp = max(0, Double(newPriceInputDraft) ?? 0)
+        let out = max(0, Double(newPriceOutputDraft) ?? 0)
+        let cr = max(0, Double(newPriceCacheReadDraft) ?? inp)
+        let cw = max(0, Double(newPriceCacheWriteDraft) ?? inp)
+        let ctx = PricingCatalog.defaultContextWindow(for: prefix)
+        let rule = ModelPriceRule(
+            modelPrefix: prefix,
+            inputPerMillionUSD: inp,
+            outputPerMillionUSD: out,
+            cacheReadPerMillionUSD: cr,
+            cacheWritePerMillionUSD: cw,
+            defaultContextWindow: ctx
+        )
+        var next = customPriceRules.filter { $0.modelPrefix.lowercased() != prefix.lowercased() }
+        next.insert(rule, at: 0)
+        customPriceRules = next
+        newPricePrefixDraft = ""
     }
 
     func toggleSessionExpanded(_ session: AgentSession) {
@@ -1144,6 +1234,15 @@ final class AppModel {
                 }
             }
         }
+        pricingSyncTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            while !Task.isCancelled {
+                if let self, self.autoSyncPricingEnabled {
+                    await self.syncModelPricingIfNeeded()
+                }
+                try? await Task.sleep(for: .seconds(6 * 3600))
+            }
+        }
         restartBalancePolling()
     }
 
@@ -1268,6 +1367,11 @@ final class AppModel {
         if ud.object(forKey: "notificationsEnabled") != nil {
             notificationsEnabled = ud.bool(forKey: "notificationsEnabled")
         }
+        if ud.object(forKey: "autoSyncPricingEnabled") != nil {
+            autoSyncPricingEnabled = ud.bool(forKey: "autoSyncPricingEnabled")
+        }
+        customPriceRules = PricingCatalog.customOverrideRules
+        pricingSyncStatus = PricingCatalog.currentSyncStatus
         if let seenMap: [String: TimeInterval] = loadCodable(key: "seenAtBySessionID") {
             let minKeep = Date().addingTimeInterval(-14 * 86_400).timeIntervalSince1970
             seenAtBySessionID = seenMap.filter { $0.value >= minKeep }

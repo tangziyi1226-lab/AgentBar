@@ -1115,6 +1115,7 @@ struct PanelView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                .help(model.todaySummaryTooltip)
 
             Spacer()
 

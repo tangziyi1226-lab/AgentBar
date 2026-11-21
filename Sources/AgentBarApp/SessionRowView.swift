@@ -329,7 +329,7 @@ struct SessionRowView: View {
         if session.compactCount > 0 {
             items.append("压缩 \(session.compactCount) 次")
         }
-        if let cost = PricingCatalog.estimatedCostUSD(usage: session.usage, model: session.model) {
+        if let cost = PricingCatalog.estimatedCostUSD(for: session) {
             items.append(String(format: "预估 $%.2f", cost))
         }
         return FlowChipsLayout(spacing: 4) {

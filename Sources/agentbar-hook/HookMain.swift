@@ -16,7 +16,8 @@ struct AgentBarHookMain {
             Task {
                 await runSelfTest(
                     probeSSH: args.contains("--probe-ssh"),
-                    probeDSH: args.contains("--probe-dsh")
+                    probeDSH: args.contains("--probe-dsh"),
+                    printMetrics: args.contains("--print-metrics")
                 )
                 Foundation.exit(0)
             }
@@ -27,7 +28,7 @@ struct AgentBarHookMain {
         }
     }
 
-    private static func runSelfTest(probeSSH: Bool = false, probeDSH: Bool = false) async {
+    private static func runSelfTest(probeSSH: Bool = false, probeDSH: Bool = false, printMetrics: Bool = false) async {
         let jsonl = """
         {"type":"user","cwd":"/Users/test/repo","sessionId":"s-1","timestamp":"2026-11-19T04:00:00.000Z","message":{"role":"user","content":"帮我修 bug"}}
         {"type":"ai-title","aiTitle":"修复加载器崩溃","sessionId":"s-1"}
@@ -340,6 +341,25 @@ struct AgentBarHookMain {
         precondition(DeepSeekAccountUsageService.formatBalance(Decimal(string: "0.004")!, symbol: "¥") == "<¥0.01")
         precondition(DeepSeekAccountUsageService.formatBalance(Decimal(string: "1234.569")!, symbol: "¥") == "¥1,234.56")
 
+        // Unit tests: forked Codex baseline subtraction + cross-day todayUsage + pricing catalog matching
+        let dayCutoff = Calendar.current.startOfDay(for: now)
+        let forkedSession = CodexAdapter.parseRollout(
+            jsonl: """
+            {"timestamp":"\(isoNow.string(from: now.addingTimeInterval(-30)))","type":"session_meta","payload":{"id":"fork-1","forked_from_id":"parent-1","attached_thread":true,"cwd":"/tmp/p","originator":"Codex Desktop","source":"vscode"}}
+            {"timestamp":"\(isoNow.string(from: now.addingTimeInterval(-25)))","type":"turn_context","payload":{"model":"gateway/glm-53:latest"}}
+            {"timestamp":"\(isoNow.string(from: now.addingTimeInterval(-20)))","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":69154423,"cached_input_tokens":66079403,"cache_write_input_tokens":0,"output_tokens":566724,"reasoning_output_tokens":100,"total_tokens":69721147},"last_token_usage":{"input_tokens":173803,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":198,"reasoning_output_tokens":100,"total_tokens":174001}}}}
+            """,
+            filePath: "/tmp/rollout-fork-1.jsonl",
+            fileModificationDate: now,
+            host: .local,
+            dayCutoff: dayCutoff
+        )!
+        precondition(forkedSession.usage.totalTokens == 174_001)
+        precondition(forkedSession.effectiveTodayUsage(dayCutoff: dayCutoff).totalTokens == 174_001)
+        precondition(PricingCatalog.rule(for: "claude-opus-5-5", customRules: PricingCatalog.defaults)?.inputPerMillionUSD == 4.0)
+        precondition(PricingCatalog.rule(for: "openai/gpt-5.3-codex", customRules: PricingCatalog.defaults)?.inputPerMillionUSD == 1.75)
+        precondition(PricingCatalog.rule(for: "gateway/glm-53:latest", customRules: PricingCatalog.defaults)?.inputPerMillionUSD == 1.2)
+
         let realClaude = await ClaudeCodeAdapter.loadLocalSessions(lookbackHours: 168)
         let realCodex = await CodexAdapter.loadLocalSessions(lookbackHours: 168)
         let realDSH = await DeepSeekHarnessAdapter.loadLocalSessions(lookbackHours: 168)
@@ -348,6 +368,7 @@ struct AgentBarHookMain {
         precondition(Set(combinedReal.map(\.id)).count == combinedReal.count, "Duplicate session IDs detected!")
         let sshEntries = SSHProbeService.discoverSSHConfigEntries()
         print("PASS self-test | local sessions -> claude=\(realClaude.count), codex=\(realCodex.count), dsh=\(realDSH.count), cursor=\(realCursor.count), ssh_hosts=\(sshEntries.count)")
+        var allSessionsForMetrics = combinedReal
         if probeDSH {
             let snap = await DeepSeekAccountUsageService.fetchSnapshot()
             let reading = snap.toBalanceReading(source: .deepSeekHarnessPreset)
@@ -362,6 +383,7 @@ struct AgentBarHookMain {
                     }
                 }
                 for await (idx, res) in group {
+                    allSessionsForMetrics.append(contentsOf: res.sessions)
                     let claudeCount = res.sessions.filter { $0.kind == .claudeCode }.count
                     let runningCount = res.sessions.filter { StatusCategoryFilter.running.matches($0) }.count
                     print("SSH host #\(idx): online=\(res.connection.isOnline), latency=\(res.connection.latencyMs ?? -1)ms, sessions=\(res.sessions.count) (claude=\(claudeCount), running=\(runningCount)), err=\(res.connection.errorMessage ?? "none")")
@@ -370,6 +392,30 @@ struct AgentBarHookMain {
                     }
                 }
             }
+        }
+        if printMetrics {
+            let syncStatus = await PricingCatalogSyncService.syncNow()
+            let localAnalytics = SubscriptionAndStatsService.buildAnalytics(sessions: combinedReal)
+            let totalAnalytics = SubscriptionAndStatsService.buildAnalytics(sessions: allSessionsForMetrics)
+            print(String(
+                format: "METRICS [pricing=%@ active=%d synced=%d 304=%@] | local today=%@ [net=%@] ($%.2f, sessions=%d) | all(+SSH) today=%@ [net=%@] ($%.2f, sessions=%d) | window=%@ [net=%@] ($%.2f, sessions=%d)",
+                syncStatus.source,
+                syncStatus.activeModelCount,
+                syncStatus.syncedModelCount,
+                String(syncStatus.usedNotModified304),
+                FormattingHelpers.compactTokens(localAnalytics.todayUsage.totalTokens),
+                FormattingHelpers.compactTokens(localAnalytics.todayUsage.uncachedInputOutputTokens),
+                localAnalytics.todayCostUSD,
+                localAnalytics.todaySessionCount,
+                FormattingHelpers.compactTokens(totalAnalytics.todayUsage.totalTokens),
+                FormattingHelpers.compactTokens(totalAnalytics.todayUsage.uncachedInputOutputTokens),
+                totalAnalytics.todayCostUSD,
+                totalAnalytics.todaySessionCount,
+                FormattingHelpers.compactTokens(totalAnalytics.allUsage.totalTokens),
+                FormattingHelpers.compactTokens(totalAnalytics.allUsage.uncachedInputOutputTokens),
+                totalAnalytics.allCostUSD,
+                totalAnalytics.allSessionCount
+            ))
         }
     }
 
