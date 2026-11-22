@@ -410,7 +410,7 @@ final class AppModel {
         return groups.map { ($0.host, $0.connection, $0.totalSessionCount) }
     }
 
-    var todaySummaryText: String {
+    var todaySummaryLines: (usage: String, cost: String) {
         _ = pricingRevision
         let dayCutoff = Calendar.current.startOfDay(for: Date())
         let uniqueSessions = SessionDeduplicator.deduplicate(sessions)
@@ -440,13 +440,13 @@ final class AppModel {
             ? String(format: "%.0f%%", (Double(totalCacheRead) / Double(totalPrompt)) * 100.0)
             : "—"
         let costStr = String(format: "$%.2f", totalCost)
-        return "今日 \(tokStr) tokens (净 \(netStr)) · 缓存 \(hitStr) · 预估 \(costStr)"
+        return ("今日 \(tokStr) tokens（净 \(netStr)）", "缓存 \(hitStr) · 预估 \(costStr)")
     }
 
     var todaySummaryTooltip: String {
         let u = totalAnalytics.todayUsage
         return String(
-            format: "含缓存总计：%@ tokens\n净输入+输出（同网关口径）：%@（输入 %@ · 输出 %@）\n缓存读：%@ · 缓存写：%@\n今日预估 API 等值费用：$%.2f",
+            format: "含缓存总计：%@ tokens\n净输入+输出：%@（输入 %@ · 输出 %@）\n缓存读：%@ · 缓存写：%@\n今日预估 API 等值费用：$%.2f",
             FormattingHelpers.compactTokens(u.totalTokens),
             FormattingHelpers.compactTokens(u.uncachedInputOutputTokens),
             FormattingHelpers.compactTokens(u.input),

@@ -312,12 +312,10 @@ public enum CodexAdapter {
         var seenOffsets: Set<Int> = []
         var collected: [(offset: Int, line: String)] = []
 
-        for needle in [tokenCountNeedle, turnContextTypeNeedle, threadSettingsNeedle] {
+        for needle in [tokenCountNeedle, turnContextTypeNeedle, threadSettingsNeedle, Data("\"task_started\"".utf8)] {
             var cursor = range.lowerBound
-            var count = 0
-            while cursor < range.upperBound && count < 4000 {
+            while cursor < range.upperBound {
                 guard let hit = data.range(of: needle, in: cursor..<range.upperBound) else { break }
-                count += 1
                 let lineStart: Int
                 if let prevNL = data[range.lowerBound..<hit.lowerBound].lastIndex(of: newline) {
                     lineStart = prevNL + 1
@@ -467,6 +465,8 @@ public enum CodexAdapter {
         var sawTodayTokenCount = false
         var modelUsages: [String: TokenUsage] = [:]
         var todayModelUsages: [String: TokenUsage] = [:]
+        var longInputUsages: [String: TokenUsage] = [:]
+        var todayLongInputUsages: [String: TokenUsage] = [:]
         var contextUsed: Int?
         var contextWindow: Int?
         var firstUserMessage: String?
@@ -478,6 +478,7 @@ public enum CodexAdapter {
         var failedTools = 0
         var turnOpen = false
         var turnCount = 0
+        var todayTurnCount = 0
         var compactCount = 0
         var lastDurationMs: Double?
         var lastTurnOutputTokens: Int?
@@ -604,6 +605,7 @@ public enum CodexAdapter {
                 case "task_started":
                     turnOpen = true
                     turnCount += 1
+                    if let ts, ts >= dayCutoff { todayTurnCount += 1 }
                     errorBanner = nil
                     if let cw = payload["model_context_window"] as? Int, cw > 0 {
                         contextWindow = cw
@@ -641,7 +643,7 @@ public enum CodexAdapter {
                             }
                             if lastIn > 0 || lastOut > 0 || lastCW > 0 {
                                 curLastUsage = TokenUsage(
-                                    input: max(0, lastIn - lastCached),
+                                    input: netInput(raw: lastIn, cached: lastCached, written: lastCW, output: lastOut, reportedTotal: last["total_tokens"] as? Int),
                                     output: lastOut,
                                     cacheRead: lastCached,
                                     cacheWrite: lastCW,
@@ -656,7 +658,7 @@ public enum CodexAdapter {
                             let output = (total["output_tokens"] as? Int) ?? 0
                             let reasoning = (total["reasoning_output_tokens"] as? Int) ?? 0
                             let curTotal = TokenUsage(
-                                input: max(0, rawInput - cached),
+                                input: netInput(raw: rawInput, cached: cached, written: cacheWrite, output: output, reportedTotal: total["total_tokens"] as? Int),
                                 output: output,
                                 cacheRead: cached,
                                 cacheWrite: cacheWrite,
@@ -666,6 +668,11 @@ public enum CodexAdapter {
                                 let eventDate = ts ?? fileModificationDate
                                 if !sawFirstTokenCount {
                                     sawFirstTokenCount = true
+                                    if isForkedThread, curLastUsage == nil,
+                                       let last = info["last_token_usage"] as? [String: Any],
+                                       last["input_tokens"] as? Int == 0, last["output_tokens"] as? Int == 0 {
+                                        shardBaseline = curTotal
+                                    }
                                     if let curLastUsage, curLastUsage.totalTokens > 0 {
                                         hasShardScopedToday = true
                                         if totalTools <= 5 {
@@ -683,8 +690,13 @@ public enum CodexAdapter {
                                 prevThreadTotal = TokenUsage.componentMax(prevThreadTotal, curTotal)
                                 usage = (isForkedThread || hasGenuineShardStart) ? prevShardOwn : prevThreadTotal
 
+                                let longRequest = curLastUsage == stepDelta && stepDelta.totalPromptTokens > LongInputRates.threshold
+
                                 if let activeModel = model, !activeModel.isEmpty, stepDelta.totalTokens > 0 {
                                     modelUsages[activeModel] = (modelUsages[activeModel] ?? TokenUsage()).adding(stepDelta)
+                                    if longRequest {
+                                        longInputUsages[activeModel] = (longInputUsages[activeModel] ?? TokenUsage()).adding(stepDelta)
+                                    }
                                 }
 
                                 if eventDate < dayCutoff {
@@ -703,6 +715,9 @@ public enum CodexAdapter {
                                     latestTodayShardOwn = TokenUsage.componentMax(latestTodayShardOwn, shardOwn)
                                     if let activeModel = model, !activeModel.isEmpty, todayDelta.totalTokens > 0 {
                                         todayModelUsages[activeModel] = (todayModelUsages[activeModel] ?? TokenUsage()).adding(todayDelta)
+                                        if longRequest && todayDelta == stepDelta {
+                                            todayLongInputUsages[activeModel] = (todayLongInputUsages[activeModel] ?? TokenUsage()).adding(todayDelta)
+                                        }
                                     }
                                 }
                             }
@@ -853,7 +868,7 @@ public enum CodexAdapter {
             ? latestTodayShardOwn.subtractingClamped(preTodayShardOwn)
             : TokenUsage()
 
-        let session = AgentSession(
+        var session = AgentSession(
             id: sessionID,
             rawSessionID: rawID,
             kind: kind,
@@ -878,7 +893,8 @@ public enum CodexAdapter {
             recentTools: recentTail,
             totalToolCalls: totalTools,
             successfulToolCalls: max(0, totalTools - failedTools),
-            turnCount: max(1, turnCount),
+            turnCount: turnCount,
+            todayTurnCount: todayTurnCount,
             compactCount: compactCount,
             outputTokensPerSecond: tokPerSec,
             lastOutputMarkdown: lastAssistantMessage,
@@ -889,11 +905,18 @@ public enum CodexAdapter {
             lastActivityAt: lastActivityAt,
             isSeen: isSeen
         )
+        session.longInputUsages = longInputUsages.isEmpty ? nil : longInputUsages
+        session.todayLongInputUsages = todayLongInputUsages.isEmpty ? nil : todayLongInputUsages
         return ParsedRolloutResult(
             session: session,
             isSubagent: isSubagent,
             parentThreadID: parentThreadID
         )
+    }
+
+    private static func netInput(raw: Int, cached: Int, written: Int, output: Int, reportedTotal: Int?) -> Int {
+        let includesWrite = reportedTotal == raw + output && written <= raw - cached
+        return max(0, raw - cached - (includesWrite ? written : 0))
     }
 
     private static func extractCodexMessageText(content: Any?) -> String {

@@ -187,16 +187,24 @@ def parse_models_dev(root: dict[str, Any]) -> list[dict[str, Any]]:
             if not canon or canon in seen:
                 continue
             seen.add(canon)
-            rules.append(
-                {
-                    "modelPrefix": bare,
-                    "inputPerMillionUSD": round(inp, 6),
-                    "outputPerMillionUSD": round(out, 6),
-                    "cacheReadPerMillionUSD": round(cache_read, 6),
-                    "cacheWritePerMillionUSD": round(cache_write, 6),
-                    "defaultContextWindow": ctx,
-                }
-            )
+            rule = {
+                "modelPrefix": bare,
+                "inputPerMillionUSD": round(inp, 6),
+                "outputPerMillionUSD": round(out, 6),
+                "cacheReadPerMillionUSD": round(cache_read, 6),
+                "cacheWritePerMillionUSD": round(cache_write, 6),
+                "defaultContextWindow": ctx,
+            }
+            if provider_id == "openai" and bare == "gpt-6.2-astra":
+                for item in cost.get("tiers") or []:
+                    if isinstance(item, dict) and item.get("tier") == {"type": "context", "size": 272000}:
+                        rates = {key: _to_float(item.get(field)) for key, field in (
+                            ("input", "input"), ("output", "output"), ("cacheRead", "cache_read"), ("cacheWrite", "cache_write")
+                        )}
+                        if all(value is not None and 0 <= value < float("inf") for value in rates.values()):
+                            rule["over272k"] = rates
+                            break
+            rules.append(rule)
 
     rules.sort(key=lambda r: (-len(canonical_model_key(r["modelPrefix"])), r["modelPrefix"]))
     return rules

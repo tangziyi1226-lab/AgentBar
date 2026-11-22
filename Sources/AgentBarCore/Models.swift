@@ -399,6 +399,8 @@ public struct AgentSession: Identifiable, Codable, Hashable, Sendable {
     public var todayUsage: TokenUsage?
     public var modelUsages: [String: TokenUsage]?
     public var todayModelUsages: [String: TokenUsage]?
+    public var longInputUsages: [String: TokenUsage]?
+    public var todayLongInputUsages: [String: TokenUsage]?
     public var isForkedCodex: Bool?
     public var hasShardScopedToday: Bool?
     public var mergedShardPaths: Set<String>?
@@ -409,6 +411,7 @@ public struct AgentSession: Identifiable, Codable, Hashable, Sendable {
     public var totalToolCalls: Int
     public var successfulToolCalls: Int
     public var turnCount: Int
+    public var todayTurnCount: Int?
     public var compactCount: Int
     public var outputTokensPerSecond: Double?
     public var process: ProcessStats?
@@ -451,6 +454,7 @@ public struct AgentSession: Identifiable, Codable, Hashable, Sendable {
         totalToolCalls: Int = 0,
         successfulToolCalls: Int = 0,
         turnCount: Int = 0,
+        todayTurnCount: Int? = nil,
         compactCount: Int = 0,
         outputTokensPerSecond: Double? = nil,
         process: ProcessStats? = nil,
@@ -491,6 +495,7 @@ public struct AgentSession: Identifiable, Codable, Hashable, Sendable {
         self.totalToolCalls = totalToolCalls
         self.successfulToolCalls = successfulToolCalls
         self.turnCount = turnCount
+        self.todayTurnCount = todayTurnCount
         self.compactCount = compactCount
         self.outputTokensPerSecond = outputTokensPerSecond
         self.process = process
@@ -552,6 +557,8 @@ public struct AgentSession: Identifiable, Codable, Hashable, Sendable {
         }()
 
         usage = usage.adding(child.usage)
+        longInputUsages = SessionDeduplicator.mergeModelUsageMaps(longInputUsages, child.longInputUsages, additive: true)
+        todayLongInputUsages = SessionDeduplicator.mergeModelUsageMaps(todayLongInputUsages, child.todayLongInputUsages, additive: true)
         todayUsage = parentToday.adding(childToday)
         modelUsages = SessionDeduplicator.mergeModelUsageMaps(seededParentModels, seededChildModels, additive: true)
         todayModelUsages = SessionDeduplicator.mergeModelUsageMaps(
@@ -969,7 +976,12 @@ public enum SessionDeduplicator {
         }
 
         if isDistinctShardFile {
+            out.longInputUsages = mergeModelUsageMaps(newer.longInputUsages, older.longInputUsages, additive: shardScoped)
+            out.todayLongInputUsages = mergeModelUsageMaps(newer.todayLongInputUsages, older.todayLongInputUsages, additive: shardScoped)
             out.turnCount = newer.turnCount + older.turnCount
+            if let newerToday = newer.todayTurnCount, let olderToday = older.todayTurnCount {
+                out.todayTurnCount = newerToday + olderToday
+            }
             out.totalToolCalls = newer.totalToolCalls + older.totalToolCalls
             out.successfulToolCalls = newer.successfulToolCalls + older.successfulToolCalls
             out.compactCount = newer.compactCount + older.compactCount
