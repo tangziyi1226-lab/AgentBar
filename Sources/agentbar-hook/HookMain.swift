@@ -1,5 +1,19 @@
 import AgentBarCore
+import Darwin
 import Foundation
+
+nonisolated(unsafe) private var gSignalPendingPath: UnsafeMutablePointer<CChar>?
+nonisolated(unsafe) private var gSignalDecisionPath: UnsafeMutablePointer<CChar>?
+
+private let hookCleanupSignalHandler: @convention(c) (Int32) -> Void = { _ in
+    if let p = gSignalPendingPath {
+        unlink(p)
+    }
+    if let d = gSignalDecisionPath {
+        unlink(d)
+    }
+    _exit(0)
+}
 
 @main
 struct AgentBarHookMain {
@@ -11,7 +25,12 @@ struct AgentBarHookMain {
 
         switch subcommand {
         case "claude-permission":
-            handleClaudePermission(json: json)
+            handlePermission(json: json, defaultKind: .claudeCode)
+        case "codex-permission":
+            handlePermission(json: json, defaultKind: .codexCLI)
+        case "codex-event":
+            let eventName = args.dropFirst().first ?? (json["hook_event_name"] as? String) ?? "event"
+            handleLifecycleEvent(tool: "codex", eventName: eventName, json: json)
         case "self-test":
             Task {
                 await runSelfTest(
@@ -24,7 +43,7 @@ struct AgentBarHookMain {
             RunLoop.main.run()
         default:
             let eventName = args.dropFirst().first ?? (json["hook_event_name"] as? String) ?? "event"
-            recordEvent(tool: "claude-code", eventName: eventName, json: json)
+            handleLifecycleEvent(tool: "claude-code", eventName: eventName, json: json)
         }
     }
 
@@ -503,6 +522,205 @@ struct AgentBarHookMain {
         let freeAstra = ModelPriceRule(modelPrefix: "byr/gpt-6.2-astra", inputPerMillionUSD: 0, outputPerMillionUSD: 0, cacheReadPerMillionUSD: 0, cacheWritePerMillionUSD: 0, defaultContextWindow: 1_000_000)
         precondition(PricingCatalog.estimatedTodayCostUSD(for: astraRow, rules: [freeAstra]) == 0)
 
+        // Unit tests: Codex awaitingApproval (escalated exec, request_permissions, request_user_input, granular policy)
+        // and Guardian auto-review subagent isolation
+        let recentTS = isoNow.string(from: now.addingTimeInterval(-6))
+        let codexExecApproval = CodexAdapter.parseRollout(
+            jsonl: """
+            {"timestamp":"\(recentTS)","type":"session_meta","payload":{"id":"cx-appr-1","cwd":"/tmp/proj","originator":"Codex Desktop","source":"vscode"}}
+            {"timestamp":"\(recentTS)","type":"turn_context","payload":{"model":"gpt-5.4","approval_policy":{"granular":{"sandbox_approval":true,"request_permissions":true}},"approvals_reviewer":"user"}}
+            {"timestamp":"\(recentTS)","type":"event_msg","payload":{"type":"task_started"}}
+            {"timestamp":"\(recentTS)","type":"response_item","payload":{"type":"message","role":"user","content":"拉取线上日志"}}
+            {"timestamp":"\(recentTS)","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"curl -fsSL https://example.com\\",\\"justification\\":\\"需要外网权限\\",\\"sandbox_permissions\\":\\"require_escalated\\"}","call_id":"call_esc_1"}}
+            """,
+            filePath: "/tmp/rollout-cx-appr-1.jsonl",
+            fileModificationDate: now,
+            host: .local
+        )!
+        precondition(codexExecApproval.status == .awaitingApproval, "Escalated exec_command should enter .awaitingApproval")
+        precondition(codexExecApproval.pendingApproval?.toolName == "exec_command")
+        precondition(codexExecApproval.pendingApproval?.commandOrSummary.contains("需要外网权限") == true)
+
+        // When approvals_reviewer == "auto_review", Guardian handles sandbox_permissions automatically -> NOT awaitingApproval
+        let codexAutoReviewExec = CodexAdapter.parseRollout(
+            jsonl: """
+            {"timestamp":"\(recentTS)","type":"session_meta","payload":{"id":"cx-appr-auto","cwd":"/tmp/proj","originator":"Codex Desktop","source":"vscode"}}
+            {"timestamp":"\(recentTS)","type":"turn_context","payload":{"model":"gpt-5.4","approval_policy":"on-request","approvals_reviewer":"auto_review"}}
+            {"timestamp":"\(recentTS)","type":"event_msg","payload":{"type":"task_started"}}
+            {"timestamp":"\(recentTS)","type":"response_item","payload":{"type":"message","role":"user","content":"自动审查模式"}}
+            {"timestamp":"\(recentTS)","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\\"cmd\\":\\"ls\\",\\"sandbox_permissions\\":\\"require_escalated\\"}","call_id":"call_esc_2"}}
+            """,
+            filePath: "/tmp/rollout-cx-appr-auto.jsonl",
+            fileModificationDate: now,
+            host: .local
+        )!
+        precondition(codexAutoReviewExec.status == .runningTool, "auto_review must not surface escalated exec as user approval")
+
+        // Structured request_user_input question enters .awaitingApproval and clears on function_call_output
+        let codexQuestionBase = """
+        {"timestamp":"\(recentTS)","type":"session_meta","payload":{"id":"cx-q-1","cwd":"/tmp/proj","originator":"codex_cli_rs","source":"cli"}}
+        {"timestamp":"\(recentTS)","type":"event_msg","payload":{"type":"task_started"}}
+        {"timestamp":"\(recentTS)","type":"response_item","payload":{"type":"message","role":"user","content":"配置部署方案"}}
+        {"timestamp":"\(recentTS)","type":"response_item","payload":{"type":"function_call","name":"request_user_input","arguments":"{\\"questions\\":[{\\"header\\":\\"环境\\",\\"question\\":\\"部署到哪个集群？\\"}]}","call_id":"call_q_1"}}
+        """
+        let codexQuestionOpen = CodexAdapter.parseRollout(
+            jsonl: codexQuestionBase,
+            filePath: "/tmp/rollout-cx-q-1.jsonl",
+            fileModificationDate: now,
+            host: .local
+        )!
+        precondition(codexQuestionOpen.status == .awaitingApproval)
+        precondition(codexQuestionOpen.overview.contains("环境：部署到哪个集群？"))
+        let codexQuestionAnswered = CodexAdapter.parseRollout(
+            jsonl: codexQuestionBase + "\n" + #"{"timestamp":"\#(recentTS)","type":"response_item","payload":{"type":"function_call_output","call_id":"call_q_1","output":"prod"}}"#,
+            filePath: "/tmp/rollout-cx-q-1.jsonl",
+            fileModificationDate: now,
+            host: .local
+        )!
+        precondition(codexQuestionAnswered.status == .generating)
+
+        // Guardian internal review rollout must roll up tokens into parent session without overriding parent model/status
+        let guardianHome = fm.temporaryDirectory.appendingPathComponent("agentbar-guardian-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: guardianHome) }
+        let guardianDay = guardianHome.appendingPathComponent(".codex/sessions/2026/11/23", isDirectory: true)
+        try! fm.createDirectory(at: guardianDay, withIntermediateDirectories: true)
+        let parentRollout = """
+        {"timestamp":"\(recentTS)","type":"session_meta","payload":{"id":"parent-cx-1","cwd":"/tmp/proj","originator":"Codex Desktop","source":"vscode"}}
+        {"timestamp":"\(recentTS)","type":"turn_context","payload":{"model":"gpt-5.4"}}
+        {"timestamp":"\(recentTS)","type":"event_msg","payload":{"type":"task_started"}}
+        {"timestamp":"\(recentTS)","type":"response_item","payload":{"type":"message","role":"user","content":"主对话任务"}}
+        {"timestamp":"\(recentTS)","type":"response_item","payload":{"type":"function_call","name":"request_permissions","arguments":"{\\"reason\\":\\"写入配置目录\\"}","call_id":"call_perm_1"}}
+        {"timestamp":"\(recentTS)","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"output_tokens":100,"total_tokens":1100}}}}
+        """
+        let guardianRollout = """
+        {"timestamp":"\(recentTS)","type":"session_meta","payload":{"id":"guardian-sub-1","session_id":"parent-cx-1","cwd":"/tmp/proj","originator":"Codex Desktop","source":"vscode"}}
+        {"timestamp":"\(recentTS)","type":"turn_context","payload":{"model":"codex-auto-review"}}
+        {"timestamp":"\(recentTS)","type":"event_msg","payload":{"type":"task_started","turn_attribution":{"turn_trigger":"guardian_review"}}}
+        {"timestamp":"\(recentTS)","type":"response_item","payload":{"type":"message","role":"assistant","content":"{\\"risk_score\\":10}"}}
+        {"timestamp":"\(recentTS)","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":400,"cached_input_tokens":0,"output_tokens":50,"total_tokens":450}}}}
+        {"timestamp":"\(recentTS)","type":"event_msg","payload":{"type":"task_complete"}}
+        """
+        try! Data(parentRollout.utf8).write(to: guardianDay.appendingPathComponent("rollout-parent-cx-1.jsonl"))
+        try! Data(guardianRollout.utf8).write(to: guardianDay.appendingPathComponent("rollout-guardian-sub-1.jsonl"))
+        let loadedGuardianSessions = await CodexAdapter.loadLocalSessions(homeDirectory: guardianHome.path, lookbackHours: 24)
+        precondition(loadedGuardianSessions.count == 1)
+        precondition(loadedGuardianSessions[0].rawSessionID == "parent-cx-1")
+        precondition(loadedGuardianSessions[0].model == "gpt-5.4", "Guardian rollout must not overwrite parent model")
+        precondition(loadedGuardianSessions[0].status == .awaitingApproval, "Guardian completion must not overwrite parent awaitingApproval")
+        precondition(loadedGuardianSessions[0].usage.totalTokens == 1550, "Guardian tokens must roll up into parent")
+
+        // Unit tests: DeepSeek Harness multi-frame Zstd session.v4.jsonl.zstd approval/asked -> approval/decided & ask_user_question
+        func zstdCompressFrame(_ string: String) -> Data {
+            ZstdDecoder.encodeUncompressedFrame(Data(string.utf8))
+        }
+
+        // Verify RFC 8878 ZstdDecoder against real compressed ~/.dsh/sessions/*/*/session.v4.jsonl.zstd files if present
+        let realDSHSessionsRoot = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".dsh/sessions", isDirectory: true)
+        if let wsDirs = try? fm.contentsOfDirectory(at: realDSHSessionsRoot, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            var verifiedRealZstdCount = 0
+            for ws in wsDirs {
+                guard let sDirs = try? fm.contentsOfDirectory(at: ws, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { continue }
+                for sd in sDirs {
+                    let zstdFile = sd.appendingPathComponent("session.v4.jsonl.zstd")
+                    guard let raw = try? Data(contentsOf: zstdFile), !raw.isEmpty else { continue }
+                    let decoded = ZstdDecoder.decodeConcatenatedFrames(raw, maxDecompressedBytes: 8 * 1024 * 1024)
+                    precondition(!decoded.isEmpty, "ZstdDecoder failed to decode real DSH log: \(zstdFile.path)")
+                    let text = String(decoding: decoded, as: UTF8.self)
+                    precondition(text.contains("\"type\":\"session\""), "Decoded DSH log missing session header: \(zstdFile.path)")
+                    verifiedRealZstdCount += 1
+                }
+            }
+            if verifiedRealZstdCount > 0 {
+                print("Verified RFC 8878 ZstdDecoder across \(verifiedRealZstdCount) real DSH .jsonl.zstd logs")
+            }
+        }
+
+        let dshHome = fm.temporaryDirectory.appendingPathComponent("agentbar-dsh-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: dshHome) }
+        let dshSessionID = "019d96f0-1111-7222-8333-444455556666"
+        let dshProjCacheDir = dshHome.appendingPathComponent(".dsh/storages/session_projcache/sessions", isDirectory: true)
+        let dshSessionDir = dshHome.appendingPathComponent(".dsh/sessions/-tmp-proj/\(dshSessionID)", isDirectory: true)
+        try! fm.createDirectory(at: dshProjCacheDir, withIntermediateDirectories: true)
+        try! fm.createDirectory(at: dshSessionDir, withIntermediateDirectories: true)
+
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+        let dshProjJSON = """
+        {"updatedAt":\(nowMs),"record":{"identity":{"createdAt":\(nowMs - 10_000),"cwd":"/tmp/proj"},"rows":{"title":{"val":"DSH 审批验证"},"workingDirectory":{"val":"/tmp/proj"},"turnOutline":{"val":{"turns":[{"prompt":"推送分支并确认发布","response":""}],"draft":"准备执行推送"}},"modelSelection":{"val":{"lastUsed":{"provider":"deepseek","model":"deepseek-reasoner"}}},"approvalState":{"val":{"policy":"ask","turnOpen":true}},"userQuestions":{"val":{"questions":{"active":[]}}},"tokenUsage":{"val":{"totals":{"uncachedInputTokens":2000,"outputTokens":150,"cacheReadTokens":1200,"cacheWriteTokens":0}}}}}}
+        """
+        try! Data(dshProjJSON.utf8).write(to: dshProjCacheDir.appendingPathComponent("\(dshSessionID).json"))
+
+        let dshFrame1 = zstdCompressFrame("""
+        {"type":"session/seed","seq":1,"time":"\(recentTS)","data":{"sessionId":"\(dshSessionID)","cwd":"/tmp/proj","title":"DSH 审批验证"}}
+        {"type":"turn/start","seq":2,"time":"\(recentTS)","data":{}}
+        {"type":"tool/call","seq":3,"time":"\(recentTS)","data":{"callId":"tc_bash_1","name":"bash","input":{"command":"git push --force origin main"}}}
+        {"type":"approval/asked","seq":4,"time":"\(recentTS)","data":{"id":"appr_1","toolName":"bash","callId":"tc_bash_1","reason":"需要强制推送远端分支","subject":{"command":"git push --force origin main"}}}
+        """ + "\n")
+        let dshLogURL = dshSessionDir.appendingPathComponent("session.v4.jsonl.zstd")
+        try! dshFrame1.write(to: dshLogURL)
+
+        let dshPendingList = await DeepSeekHarnessAdapter.loadLocalSessions(homeDirectory: dshHome.path, lookbackHours: 24)
+        precondition(dshPendingList.count == 1)
+        precondition(dshPendingList[0].status == .awaitingApproval, "DSH approval/asked must set .awaitingApproval")
+        precondition(dshPendingList[0].pendingApproval?.toolName == "bash")
+        precondition(dshPendingList[0].pendingApproval?.highRiskMatchedRule == "git push --force", "High-risk git push --force rule should match")
+
+        // Append second concatenated Zstd frame deciding approval + opening ask_user_question
+        let dshFrame2 = zstdCompressFrame("""
+        {"type":"approval/decided","seq":5,"time":"\(isoNow.string(from: now))","data":{"id":"appr_1","outcome":"allowed-once"}}
+        {"type":"tool/result","seq":6,"time":"\(isoNow.string(from: now))","data":{"callId":"tc_bash_1","status":"ok"}}
+        {"type":"tool/call","seq":7,"time":"\(isoNow.string(from: now))","data":{"callId":"tc_q_1","name":"ask_user_question","input":{"questions":[{"header":"发布确认","question":"是否同步创建 GitHub Release？"}]}}}
+        """ + "\n")
+        var combinedFrames = dshFrame1
+        combinedFrames.append(dshFrame2)
+        try! combinedFrames.write(to: dshLogURL)
+
+        let dshQuestionList = await DeepSeekHarnessAdapter.loadLocalSessions(homeDirectory: dshHome.path, lookbackHours: 24)
+        precondition(dshQuestionList[0].status == .awaitingApproval, "DSH open ask_user_question must set .awaitingApproval")
+        precondition(dshQuestionList[0].pendingApproval?.toolName == "ask_user_question")
+        precondition(dshQuestionList[0].overview.contains("发布确认：是否同步创建 GitHub Release？"))
+
+        // Append third Zstd frame settling ask_user_question and ending turn
+        let dshFrame3 = zstdCompressFrame("""
+        {"type":"tool/result","seq":8,"time":"\(isoNow.string(from: now))","data":{"callId":"tc_q_1","status":"ok"}}
+        {"type":"turn/end","seq":9,"time":"\(isoNow.string(from: now))","data":{}}
+        """ + "\n")
+        combinedFrames.append(dshFrame3)
+        try! combinedFrames.write(to: dshLogURL)
+        let dshProjDoneJSON = dshProjJSON.replacingOccurrences(of: "\"turnOpen\":true", with: "\"turnOpen\":false")
+        try! Data(dshProjDoneJSON.utf8).write(to: dshProjCacheDir.appendingPathComponent("\(dshSessionID).json"))
+
+        let dshSettledList = await DeepSeekHarnessAdapter.loadLocalSessions(homeDirectory: dshHome.path, lookbackHours: 24)
+        precondition(dshSettledList[0].status != .awaitingApproval && dshSettledList[0].pendingApproval == nil, "DSH settled turn must clear awaitingApproval")
+
+        // Unit tests: non-destructive Codex & Claude hook installation preserving existing 3rd-party hooks & TOML tables
+        let hookTestHome = fm.temporaryDirectory.appendingPathComponent("agentbar-hook-install-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: hookTestHome) }
+        let hookCodexDir = hookTestHome.appendingPathComponent(".codex", isDirectory: true)
+        try! fm.createDirectory(at: hookCodexDir, withIntermediateDirectories: true)
+        let existingHooksJSON = """
+        {"hooks":{"PermissionRequest":[{"hooks":[{"type":"command","command":"/usr/local/bin/codeisland-bridge --source codex","timeout":86400}]}]}}
+        """
+        let existingConfigTOML = """
+        model = "gpt-5.4"
+
+        [projects."/tmp/proj"]
+        trust_level = "trusted"
+        """
+        try! Data(existingHooksJSON.utf8).write(to: hookCodexDir.appendingPathComponent("hooks.json"))
+        try! Data(existingConfigTOML.utf8).write(to: hookCodexDir.appendingPathComponent("config.toml"))
+        precondition(!HookApprovalManager.isCodexHooksInstalled(homeDirectory: hookTestHome.path))
+        _ = try! HookApprovalManager.installCodexHooks(hookExecutablePath: "/Applications/AgentBar.app/Contents/MacOS/agentbar-hook", homeDirectory: hookTestHome.path)
+        precondition(HookApprovalManager.isCodexHooksInstalled(homeDirectory: hookTestHome.path))
+        let mergedHooksObj = try! JSONSerialization.jsonObject(with: Data(contentsOf: hookCodexDir.appendingPathComponent("hooks.json"))) as! [String: Any]
+        let permGroups = (mergedHooksObj["hooks"] as! [String: Any])["PermissionRequest"] as! [[String: Any]]
+        precondition(permGroups.count == 2, "Must preserve existing index-0 hook group and append agentbar-hook at index 1")
+        let firstCmd = ((permGroups[0]["hooks"] as! [[String: Any]])[0]["command"] as! String)
+        precondition(firstCmd.contains("codeisland-bridge"), "Existing index-0 hook must remain at index 0 for trusted_hash stability")
+        let updatedTOML = try! String(contentsOf: hookCodexDir.appendingPathComponent("config.toml"), encoding: .utf8)
+        let hooksKeyRange = updatedTOML.range(of: "features.hooks = true")
+        let projectsSectionRange = updatedTOML.range(of: "[projects.\"/tmp/proj\"]")
+        precondition(hooksKeyRange != nil && projectsSectionRange != nil && hooksKeyRange!.lowerBound < projectsSectionRange!.lowerBound, "features.hooks = true must be placed at top-level before [projects] table")
+
         let scannedProcs = ProcessAndChatScanner.scanLocalAgentProcesses()
         precondition(scannedProcs.allSatisfy { $0.pid > 0 && !$0.command.isEmpty })
 
@@ -580,18 +798,39 @@ struct AgentBarHookMain {
         }
     }
 
-    private static func handleClaudePermission(json: [String: Any]) {
+    private static func installCleanupSignals(pendingPath: String, decisionPath: String) {
+        gSignalPendingPath = strdup(pendingPath)
+        gSignalDecisionPath = strdup(decisionPath)
+        for sig in [SIGTERM, SIGINT, SIGHUP, SIGPIPE] {
+            var action = sigaction()
+            action.__sigaction_u.__sa_handler = hookCleanupSignalHandler
+            sigemptyset(&action.sa_mask)
+            action.sa_flags = 0
+            sigaction(sig, &action, nil)
+        }
+    }
+
+    private static func handlePermission(json: [String: Any], defaultKind: AgentKind) {
         HookApprovalManager.ensureDirectories()
         let requestID = UUID().uuidString
         let sessionID = json["session_id"] as? String
         let cwd = json["cwd"] as? String
         let toolName = (json["tool_name"] as? String) ?? "Tool"
-        let toolInput = json["tool_input"]
-        let summary = ClaudeCodeAdapter.summarizeToolInput(name: toolName, input: toolInput)
+        let rawToolInput = json["tool_input"]
+        let normalizedInput: Any?
+        if let inputStr = rawToolInput as? String,
+           let inputData = inputStr.data(using: .utf8),
+           let parsed = try? JSONSerialization.jsonObject(with: inputData) {
+            normalizedInput = parsed
+        } else {
+            normalizedInput = rawToolInput
+        }
+        let summary = ClaudeCodeAdapter.summarizeToolInput(name: toolName, input: normalizedInput)
 
         let pending = PendingApproval(
             requestID: requestID,
             sessionID: sessionID,
+            agentKind: defaultKind,
             host: .local,
             toolName: toolName,
             commandOrSummary: summary,
@@ -605,6 +844,7 @@ struct AgentBarHookMain {
         encoder.dateEncodingStrategy = .iso8601
         let pendingURL = HookApprovalManager.pendingDirectory.appendingPathComponent("\(requestID).json")
         let decisionURL = HookApprovalManager.decisionsDirectory.appendingPathComponent("\(requestID).json")
+        installCleanupSignals(pendingPath: pendingURL.path, decisionPath: decisionURL.path)
         defer {
             try? FileManager.default.removeItem(at: pendingURL)
             try? FileManager.default.removeItem(at: decisionURL)
@@ -620,10 +860,16 @@ struct AgentBarHookMain {
         let deadline = Date().addingTimeInterval(120)
 
         while Date() < deadline {
+            if getppid() == 1 || !FileManager.default.fileExists(atPath: pendingURL.path) {
+                return
+            }
             if let decisionData = try? Data(contentsOf: decisionURL),
                let decision = try? decoder.decode(ApprovalDecisionPayload.self, from: decisionData) {
                 switch decision.action {
                 case .allow:
+                    if let sessionID, !sessionID.isEmpty {
+                        HookApprovalManager.markPermissionResolved(sessionID: sessionID)
+                    }
                     let response: [String: Any] = [
                         "hookSpecificOutput": [
                             "hookEventName": "PermissionRequest",
@@ -634,6 +880,9 @@ struct AgentBarHookMain {
                     ]
                     writeJSONStdout(response)
                 case .deny:
+                    if let sessionID, !sessionID.isEmpty {
+                        HookApprovalManager.markPermissionResolved(sessionID: sessionID)
+                    }
                     let response: [String: Any] = [
                         "hookSpecificOutput": [
                             "hookEventName": "PermissionRequest",
@@ -645,13 +894,26 @@ struct AgentBarHookMain {
                     ]
                     writeJSONStdout(response)
                 case .passthrough:
-                    // Print nothing -> Claude Code falls back to terminal prompt
+                    // Print nothing -> Claude Code / Codex falls back to native prompt
                     break
                 }
                 return
             }
             Thread.sleep(forTimeInterval: 0.25)
         }
+    }
+
+    private static func handleLifecycleEvent(tool: String, eventName: String, json: [String: Any]) {
+        if let sid = json["session_id"] as? String, !sid.isEmpty {
+            switch eventName {
+            case "PostToolUse", "Stop", "Interrupt", "UserPromptSubmit", "SessionEnd":
+                HookApprovalManager.clearPendingApprovals(forSessionID: sid)
+                HookApprovalManager.markPermissionResolved(sessionID: sid)
+            default:
+                break
+            }
+        }
+        recordEvent(tool: tool, eventName: eventName, json: json)
     }
 
     private static func recordEvent(tool: String, eventName: String, json: [String: Any]) {

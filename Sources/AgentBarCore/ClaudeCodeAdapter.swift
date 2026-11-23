@@ -119,6 +119,23 @@ public enum ClaudeCodeAdapter {
             var statusInferred = false
             if session.errorBanner != nil && ageSeconds < 7200 {
                 status = .failed
+            } else if let tool = session.currentTool,
+                      (tool.name == "AskUserQuestion" || tool.name == "ExitPlanMode"),
+                      ageSeconds < 3600 {
+                status = .awaitingApproval
+                if session.pendingApproval == nil {
+                    session.pendingApproval = PendingApproval(
+                        requestID: "\(session.id):passive:\(tool.id)",
+                        sessionID: session.rawSessionID,
+                        agentKind: session.kind,
+                        host: session.host,
+                        toolName: tool.name,
+                        commandOrSummary: tool.summary,
+                        cwd: session.cwd,
+                        requestedAt: tool.startedAt,
+                        canRespondViaHook: false
+                    )
+                }
             } else if session.currentTool != nil && ageSeconds < 1800 {
                 status = .runningTool
                 statusInferred = ageSeconds > 8 && ageSeconds < 300
@@ -1056,7 +1073,37 @@ public enum ClaudeCodeAdapter {
 
     public static func summarizeToolInput(name: String, input: Any?) -> String {
         if let dict = input as? [String: Any] {
-            for key in ["command", "cmd", "file_path", "path", "pattern", "query", "url", "description", "skill", "notebook_path", "prompt"] {
+            if let questions = dict["questions"] as? [[String: Any]],
+               let firstQ = questions.first {
+                let header = (firstQ["header"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let question = (firstQ["question"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if !header.isEmpty && !question.isEmpty {
+                    return firstSingleLine("\(header)：\(question)", maxLength: 72)
+                }
+                if !question.isEmpty {
+                    return firstSingleLine(question, maxLength: 72)
+                }
+                if !header.isEmpty {
+                    return firstSingleLine(header, maxLength: 72)
+                }
+            }
+            if let justification = dict["justification"] as? String, !justification.isEmpty {
+                let cmd = (dict["cmd"] as? String) ?? (dict["command"] as? String) ?? ""
+                if !cmd.isEmpty {
+                    let shortJust = firstSingleLine(justification, maxLength: 28)
+                    let shortCmd = firstSingleLine(cmd, maxLength: 56)
+                    return firstSingleLine("\(shortJust) · \(shortCmd)", maxLength: 88)
+                }
+                return firstSingleLine(justification, maxLength: 72)
+            }
+            if let reason = dict["reason"] as? String, !reason.isEmpty {
+                return firstSingleLine(reason, maxLength: 72)
+            }
+            if let action = dict["action"] as? String, !action.isEmpty,
+               let target = dict["target"] as? String, !target.isEmpty {
+                return firstSingleLine("\(action) \(target)", maxLength: 72)
+            }
+            for key in ["command", "cmd", "file_path", "path", "pattern", "query", "url", "description", "skill", "notebook_path", "prompt", "question"] {
                 if let val = dict[key] as? String, !val.isEmpty {
                     return firstSingleLine(val, maxLength: 72)
                 }

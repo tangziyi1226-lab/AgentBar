@@ -139,6 +139,7 @@ final class AppModel {
     var standaloneMarkdownSession: AgentSession?
     var newSSHAliasDraft: String = ""
     var hookInstallMessage: String?
+    var codexHookInstallMessage: String?
     var quickBannerToast: String?
     var balanceTestMessage: [UUID: String] = [:]
     var tokenInputs: [UUID: String] = [:]
@@ -673,17 +674,38 @@ final class AppModel {
     }
 
     var isHookInstalled: Bool {
-        HookApprovalManager.isClaudeHooksInstalled()
+        let claudeInstalled = HookApprovalManager.isClaudeHooksInstalled()
+        let codexDirExists = FileManager.default.fileExists(
+            atPath: (NSHomeDirectory() as NSString).appendingPathComponent(".codex")
+        )
+        let codexInstalled = !codexDirExists || HookApprovalManager.isCodexHooksInstalled()
+        return claudeInstalled && codexInstalled
     }
 
     func enableOneClickApprovalHooks() {
         let hookPath = HookApprovalManager.hookBinaryPath()
+        var installedTargets: [String] = []
         do {
             let saved = try HookApprovalManager.installClaudeHooks(hookExecutablePath: hookPath)
             hookInstallMessage = "✓ 已安装至 \(saved)"
-            showQuickToast("✓ 已开启 Claude 一键审批 Hook")
+            installedTargets.append("Claude Code")
         } catch {
-            showQuickToast("Hook 安装失败：\(error.localizedDescription)")
+            hookInstallMessage = "安装失败：\(error.localizedDescription)"
+        }
+        let codexDir = (NSHomeDirectory() as NSString).appendingPathComponent(".codex")
+        if FileManager.default.fileExists(atPath: codexDir) {
+            do {
+                let saved = try HookApprovalManager.installCodexHooks(hookExecutablePath: hookPath)
+                codexHookInstallMessage = "✓ 已安装至 \(saved)"
+                installedTargets.append("Codex")
+            } catch {
+                codexHookInstallMessage = "安装失败：\(error.localizedDescription)"
+            }
+        }
+        if !installedTargets.isEmpty {
+            showQuickToast("✓ 已开启 \(installedTargets.joined(separator: " & ")) 一键审批 Hook")
+        } else {
+            showQuickToast("Hook 安装失败，请在设置中查看详情")
         }
     }
 
@@ -936,6 +958,7 @@ final class AppModel {
             local.append(appSession)
         }
         mergePendingApprovals(bgResult.pendingApprovals, into: &local, host: .local)
+        notifyAdapterDetectedApprovals(in: local)
         applyLiveSeenState(to: &local)
 
         let currentRemotes = sessions.filter { !$0.host.isLocal }
@@ -1016,6 +1039,7 @@ final class AppModel {
                     var remoteList = res.sessions
                     if cfg.approvalEnabled {
                         mergePendingApprovals(res.pendingApprovals, into: &remoteList, host: hostID)
+                        notifyAdapterDetectedApprovals(in: remoteList)
                     }
                     applyLiveSeenState(to: &remoteList)
                     sessions.removeAll { $0.host == hostID }
@@ -1068,6 +1092,7 @@ final class AppModel {
             var remoteList = res.sessions
             if cfg.approvalEnabled {
                 mergePendingApprovals(res.pendingApprovals, into: &remoteList, host: hostID)
+                notifyAdapterDetectedApprovals(in: remoteList)
             }
             applyLiveSeenState(to: &remoteList)
             sessions.removeAll { $0.host == hostID }
@@ -1231,33 +1256,80 @@ final class AppModel {
         }
         ud.set(true, forKey: "dshDashboardAutoAddedV1")
     }
+    private func notifyAdapterDetectedApprovals(in list: [AgentSession]) {
+        for session in list where session.status == .awaitingApproval {
+            if let approval = session.pendingApproval {
+                triggerApprovalNotificationIfNeeded(session: session, approval: approval)
+            }
+        }
+    }
+
+    private static func matchesApprovalFamily(sessionKind: AgentKind, approvalKind: AgentKind?) -> Bool {
+        let expected = approvalKind ?? .claudeCode
+        switch expected {
+        case .codexCLI, .codexDesktop:
+            return sessionKind == .codexCLI || sessionKind == .codexDesktop
+        case .claudeCode, .claudeDesktop:
+            return sessionKind == .claudeCode || sessionKind == .claudeDesktop
+        default:
+            return sessionKind == expected
+        }
+    }
+
     private func mergePendingApprovals(
         _ approvals: [PendingApproval],
         into list: inout [AgentSession],
         host: HostID
     ) {
         for approval in approvals {
-            if let idx = list.firstIndex(where: {
-                ($0.rawSessionID == approval.sessionID) || ($0.cwd != nil && $0.cwd == approval.cwd && $0.kind == .claudeCode)
-            }) {
+            let exactIdx: Int? = {
+                guard let sid = approval.sessionID, !sid.isEmpty else { return nil }
+                return list.firstIndex {
+                    $0.rawSessionID == sid && Self.matchesApprovalFamily(sessionKind: $0.kind, approvalKind: approval.agentKind)
+                } ?? list.firstIndex { $0.rawSessionID == sid }
+            }()
+
+            let fallbackCwdIdx: Int? = {
+                guard exactIdx == nil, let cwd = approval.cwd, !cwd.isEmpty else { return nil }
+                let minRecent = approval.requestedAt.addingTimeInterval(-600)
+                return list.indices
+                    .filter { idx in
+                        list[idx].cwd == cwd
+                            && Self.matchesApprovalFamily(sessionKind: list[idx].kind, approvalKind: approval.agentKind)
+                            && list[idx].lastActivityAt >= minRecent
+                    }
+                    .max(by: { list[$0].lastActivityAt < list[$1].lastActivityAt })
+            }()
+
+            if let idx = exactIdx ?? fallbackCwdIdx {
                 list[idx].status = .awaitingApproval
                 list[idx].statusIsInferred = false
                 list[idx].pendingApproval = approval
                 list[idx].overview = "请求执行 \(approval.toolName)：\(approval.commandOrSummary)"
                 triggerApprovalNotificationIfNeeded(session: list[idx], approval: approval)
             } else {
-                let dirName = approval.cwd.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "Claude Code"
+                let targetKind = approval.agentKind ?? .claudeCode
+                let defaultProvider: String
+                switch targetKind {
+                case .codexCLI, .codexDesktop:
+                    defaultProvider = "OpenAI"
+                case .deepseekHarness, .deepseekChat:
+                    defaultProvider = "DeepSeek"
+                default:
+                    defaultProvider = "Anthropic"
+                }
+                let dirName = approval.cwd.map { URL(fileURLWithPath: $0).lastPathComponent } ?? targetKind.displayName
                 let synthetic = AgentSession(
                     id: "\(host.storageKey):approval:\(approval.requestID)",
                     rawSessionID: approval.sessionID ?? approval.requestID,
-                    kind: .claudeCode,
+                    kind: targetKind,
                     host: host,
                     title: "\(dirName) 权限请求",
                     overview: "请求执行 \(approval.toolName)：\(approval.commandOrSummary)",
                     status: .awaitingApproval,
                     cwd: approval.cwd,
                     groupDirectory: approval.cwd,
-                    provider: "Anthropic",
+                    provider: defaultProvider,
                     pendingApproval: approval,
                     startedAt: approval.requestedAt,
                     lastActivityAt: approval.requestedAt
@@ -1413,7 +1485,7 @@ final class AppModel {
         content.title = "\(session.kind.displayName) 需要审批 · \(session.title)"
         content.body = "\(approval.toolName)：\(approval.commandOrSummary)"
         content.sound = .default
-        if approval.highRiskMatchedRule == nil {
+        if approval.canRespondViaHook && approval.highRiskMatchedRule == nil {
             content.categoryIdentifier = "AGENTBAR_APPROVAL"
         }
         let req = UNNotificationRequest(identifier: approval.requestID, content: content, trigger: nil)

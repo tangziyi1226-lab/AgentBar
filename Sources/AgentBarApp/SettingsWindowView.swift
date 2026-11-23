@@ -88,51 +88,109 @@ struct SettingsWindowView: View {
 
     private var hooksApprovalTab: some View {
         let hookPath = HookApprovalManager.hookBinaryPath()
-        return VStack(alignment: .leading, spacing: 12) {
-            Text("Claude Code 一键审批与实时状态 Hook")
-                .font(.system(size: 14, weight: .bold))
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("实时待审批感知与一键放行 Hooks")
+                        .font(.system(size: 14, weight: .bold))
 
-            Text("安装后，当 Claude Code 请求执行工具时，会通过内置的 agentbar-hook 将请求实时投递到菜单栏面板与系统通知，支持直接点击“批准 / 拒绝 / 在终端处理”（超过 120 秒未操作将自动交回终端原生提示）。写入前会自动备份原配置文件为 settings.json.agentbar-bak。")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
+                    Text("AgentBar 默认已内置零侵入的待审批状态检测（支持 Claude Code、Codex 桌面端/CLI、DeepSeek Harness 的权限确认与提问界面，点击可直接跳转回对应窗口）。安装下方 Hook 后，还可在菜单栏直接点击“批准 / 拒绝”，无需切回终端或客户端（自动保留原有第三方 Hook，写入前自动备份）。")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
 
-            Text("将合并写入 ~/.claude/settings.json 的配置预览：")
-                .font(.system(size: 11.5, weight: .semibold))
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Claude Code（~/.claude/settings.json）")
+                            .font(.system(size: 12.5, weight: .semibold))
+                        Spacer()
+                        Text(HookApprovalManager.isClaudeHooksInstalled() ? "已安装" : "未安装")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(HookApprovalManager.isClaudeHooksInstalled() ? .green : .secondary)
+                    }
 
-            ScrollView {
-                Text(HookApprovalManager.previewClaudeHooksJSON(hookExecutablePath: hookPath))
-                    .font(.system(size: 11, design: .monospaced))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-                    .textSelection(.enabled)
-            }
-            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.06)))
+                    ScrollView {
+                        Text(HookApprovalManager.previewClaudeHooksJSON(hookExecutablePath: hookPath))
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                            .textSelection(.enabled)
+                    }
+                    .frame(height: 110)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.06)))
 
-            HStack(spacing: 10) {
-                Button("备份并安装 Claude Code Hooks") {
-                    do {
-                        let savedPath = try HookApprovalManager.installClaudeHooks(hookExecutablePath: hookPath)
-                        model.hookInstallMessage = "✓ 已安装至 \(savedPath)"
-                    } catch {
-                        model.hookInstallMessage = "安装失败：\(error.localizedDescription)"
+                    HStack(spacing: 10) {
+                        Button("备份并安装 Claude Code Hooks") {
+                            do {
+                                let savedPath = try HookApprovalManager.installClaudeHooks(hookExecutablePath: hookPath)
+                                model.hookInstallMessage = "✓ 已安装至 \(savedPath)"
+                            } catch {
+                                model.hookInstallMessage = "安装失败：\(error.localizedDescription)"
+                            }
+                        }
+                        .buttonStyle(.glassProminent)
+
+                        if let msg = model.hookInstallMessage {
+                            Text(msg)
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(msg.hasPrefix("✓") ? .green : .red)
+                                .lineLimit(1)
+                        }
                     }
                 }
-                .buttonStyle(.glassProminent)
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.04)))
 
-                Button("打开审批审计日志") {
-                    let url = HookApprovalManager.auditLogURL
-                    NSWorkspace.shared.activateFileViewerSelecting([url])
-                }
-                .buttonStyle(.glass)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Codex CLI & 桌面端（~/.codex/hooks.json + features.hooks）")
+                            .font(.system(size: 12.5, weight: .semibold))
+                        Spacer()
+                        Text(HookApprovalManager.isCodexHooksInstalled() ? "已安装" : "未安装")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(HookApprovalManager.isCodexHooksInstalled() ? .green : .secondary)
+                    }
 
-                if let msg = model.hookInstallMessage {
-                    Text(msg)
-                        .font(.system(size: 11.5, weight: .medium))
-                        .foregroundStyle(msg.hasPrefix("✓") ? .green : .red)
+                    ScrollView {
+                        Text(HookApprovalManager.previewCodexHooksJSON(hookExecutablePath: hookPath))
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                            .textSelection(.enabled)
+                    }
+                    .frame(height: 110)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.06)))
+
+                    HStack(spacing: 10) {
+                        Button("备份并安装 Codex Hooks") {
+                            do {
+                                let savedPath = try HookApprovalManager.installCodexHooks(hookExecutablePath: hookPath)
+                                model.codexHookInstallMessage = "✓ 已安装至 \(savedPath)"
+                            } catch {
+                                model.codexHookInstallMessage = "安装失败：\(error.localizedDescription)"
+                            }
+                        }
+                        .buttonStyle(.glassProminent)
+
+                        Button("打开审批审计日志") {
+                            let url = HookApprovalManager.auditLogURL
+                            NSWorkspace.shared.activateFileViewerSelecting([url])
+                        }
+                        .buttonStyle(.glass)
+
+                        if let msg = model.codexHookInstallMessage {
+                            Text(msg)
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(msg.hasPrefix("✓") ? .green : .red)
+                                .lineLimit(1)
+                        }
+                    }
                 }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.04)))
             }
+            .padding(8)
         }
-        .padding(8)
     }
 
     private var sshHostsTab: some View {

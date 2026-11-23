@@ -348,7 +348,7 @@ struct PanelView: View {
             }
             .controlSize(.mini)
             .buttonStyle(.glass)
-            .help("自动安装 Claude Code 审批 Hook，后续待审批可直接一键放行")
+            .help("自动安装 Claude Code 与 Codex 审批 Hook，后续待审批可直接一键放行")
         } else {
             Button {
                 model.approveAllPending()

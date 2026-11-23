@@ -28,6 +28,8 @@ public enum CodexAdapter {
         var isArchivedFile: Bool
         var isSubagent: Bool
         var parentThreadID: String?
+        var passiveApproval: PendingApproval?
+        var passiveApprovalIsEscalatedExec: Bool
 
         func materialize(
             now: Date,
@@ -66,9 +68,33 @@ public enum CodexAdapter {
                 && !readState.unreadThreadIDs.contains(rawID)
             let isSeen = isArchivedFile || seenInAgentBar || seenByActivityTime || seenByNativeUnread
 
+            var activePassiveApproval: PendingApproval?
+            if !isArchivedFile, let candidate = passiveApproval, age < 3600 {
+                if passiveApprovalIsEscalatedExec,
+                   session.host.isLocal,
+                   let resolvedAt = HookApprovalManager.lastPermissionResolvedAt(sessionID: rawID),
+                   resolvedAt >= candidate.requestedAt {
+                    activePassiveApproval = nil
+                } else {
+                    activePassiveApproval = candidate
+                }
+            }
+
             let status: SessionStatus
+            var statusInferred = false
             if session.errorBanner != nil && age < 7200 {
                 status = .failed
+            } else if let approval = activePassiveApproval {
+                status = .awaitingApproval
+                statusInferred = passiveApprovalIsEscalatedExec && age > 5
+                session.pendingApproval = approval
+                if approval.toolName == "request_user_input"
+                    || approval.toolName == "ask_user_question"
+                    || approval.toolName == "AskUserQuestion" {
+                    session.overview = "等待确认：\(approval.commandOrSummary)"
+                } else {
+                    session.overview = "请求执行 \(approval.toolName)：\(approval.commandOrSummary)"
+                }
             } else if session.currentTool != nil && age < 900 {
                 status = .runningTool
             } else if turnOpen && age < 600 {
@@ -81,6 +107,7 @@ public enum CodexAdapter {
 
             session.isSeen = isSeen
             session.status = status
+            session.statusIsInferred = statusInferred
             return ParsedRolloutResult(
                 session: session,
                 isSubagent: isSubagent,
@@ -600,6 +627,18 @@ public enum CodexAdapter {
         var isSubagent = false
         var rejectedSubagent = false
         var parentThreadID: String?
+        var metaThreadID: String?
+        var metaParentSessionID: String?
+        var approvalPolicyMode: String?
+        var granularSandboxApproval: Bool?
+        var granularRequestPermissions: Bool?
+        var approvalsReviewer: String?
+        struct OpenApprovalEntry {
+            var approval: PendingApproval
+            var isEscalatedExec: Bool
+        }
+        var openApprovals: [String: OpenApprovalEntry] = [:]
+        var openApprovalOrder: [String] = []
         var sawFirstTokenCount = false
         var hasShardScopedToday = false
         var hasGenuineShardStart = false
@@ -640,6 +679,40 @@ public enum CodexAdapter {
             }
         }
 
+        func applyApprovalSettings(from dict: [String: Any]) {
+            if let apStr = dict["approval_policy"] as? String, !apStr.isEmpty {
+                approvalPolicyMode = apStr
+                granularSandboxApproval = nil
+                granularRequestPermissions = nil
+            } else if let apObj = dict["approval_policy"] as? [String: Any],
+                      let gran = apObj["granular"] as? [String: Any] {
+                approvalPolicyMode = "granular"
+                granularSandboxApproval = gran["sandbox_approval"] as? Bool
+                granularRequestPermissions = gran["request_permissions"] as? Bool
+            }
+            if let rev = dict["approvals_reviewer"] as? String, !rev.isEmpty {
+                approvalsReviewer = rev
+            }
+        }
+
+        func promoteGuardianSubagentIfNeeded() -> Bool {
+            if !allowSubagents {
+                rejectedSubagent = true
+                return true
+            }
+            if !isSubagent {
+                isSubagent = true
+                isForkedThread = true
+                if let psid = metaParentSessionID, !psid.isEmpty {
+                    parentThreadID = psid
+                }
+                if let mid = metaThreadID, !mid.isEmpty {
+                    rawID = mid
+                }
+            }
+            return false
+        }
+
         FastJSONL.forEachJSONObject(in: data) { obj in
             if rejectedSubagent { return }
             let ts = ClaudeCodeAdapter.parseISODate(obj["timestamp"] as? String)
@@ -653,6 +726,13 @@ public enum CodexAdapter {
             switch type {
             case "session_meta":
                 guard let payload else { return }
+                if let id = payload["id"] as? String, !id.isEmpty {
+                    metaThreadID = id
+                    rawID = id
+                }
+                if let sid = payload["session_id"] as? String, !sid.isEmpty {
+                    metaParentSessionID = sid
+                }
                 let sourceObj = payload["source"] as? [String: Any]
                 let isSubagentMeta = sourceObj?["subagent"] != nil
                     || (payload["thread_source"] as? String) == "subagent"
@@ -667,12 +747,9 @@ public enum CodexAdapter {
                     parentThreadID = (payload["parent_thread_id"] as? String)
                         ?? spawnParent
                         ?? (payload["forked_from_id"] as? String)
-                        ?? (payload["session_id"] as? String)
+                        ?? metaParentSessionID
                 }
-                if let id = payload["id"] as? String, !id.isEmpty {
-                    rawID = id
-                }
-                if !isSubagentMeta, let sid = payload["session_id"] as? String, !sid.isEmpty {
+                if !isSubagentMeta, let sid = metaParentSessionID, !sid.isEmpty {
                     rawID = sid
                 }
                 if let forkedFrom = payload["forked_from_id"] as? String, !forkedFrom.isEmpty {
@@ -709,10 +786,14 @@ public enum CodexAdapter {
             case "turn_context":
                 markInTurnActivity()
                 guard let payload else { return }
+                applyApprovalSettings(from: payload)
                 if let dir = payload["cwd"] as? String, !dir.isEmpty {
                     cwd = dir
                 }
                 if let m = payload["model"] as? String, !m.isEmpty {
+                    if m == "codex-auto-review" && promoteGuardianSubagentIfNeeded() {
+                        return
+                    }
                     model = m
                 }
                 if let eff = payload["effort"] as? String, !eff.isEmpty {
@@ -736,7 +817,13 @@ public enum CodexAdapter {
                 switch ptype {
                 case "thread_settings_applied":
                     if let settings = payload["thread_settings"] as? [String: Any] {
-                        if let m = settings["model"] as? String, !m.isEmpty { model = m }
+                        applyApprovalSettings(from: settings)
+                        if let m = settings["model"] as? String, !m.isEmpty {
+                            if m == "codex-auto-review" && promoteGuardianSubagentIfNeeded() {
+                                return
+                            }
+                            model = m
+                        }
                         if let mp = settings["model_provider_id"] as? String, !mp.isEmpty {
                             provider = FormattingHelpers.providerDisplay(from: mp) ?? mp
                         }
@@ -748,6 +835,12 @@ public enum CodexAdapter {
                         }
                     }
                 case "task_started":
+                    if let attr = payload["turn_attribution"] as? [String: Any],
+                       (attr["turn_trigger"] as? String) == "guardian_review" {
+                        if promoteGuardianSubagentIfNeeded() {
+                            return
+                        }
+                    }
                     turnOpen = true
                     turnCount += 1
                     if let ts, ts >= dayCutoff { todayTurnCount += 1 }
@@ -759,6 +852,8 @@ public enum CodexAdapter {
                     turnOpen = false
                     openTools.removeAll()
                     openToolOrder.removeAll()
+                    openApprovals.removeAll()
+                    openApprovalOrder.removeAll()
                     if let dur = payload["duration_ms"] as? Double, dur > 0 {
                         lastDurationMs = dur
                     } else if let durInt = payload["duration_ms"] as? Int, durInt > 0 {
@@ -871,10 +966,60 @@ public enum CodexAdapter {
                 case "context_compacted":
                     markInTurnActivity()
                     compactCount += 1
+                case "exec_approval_request", "apply_patch_approval_request", "elicitation_request", "request_permissions", "request_user_input":
+                    markInTurnActivity()
+                    let key = (payload["call_id"] as? String)
+                        ?? (payload["approval_id"] as? String)
+                        ?? (payload["elicitation_id"] as? String)
+                        ?? ptype
+                    let toolLabel: String
+                    switch ptype {
+                    case "exec_approval_request": toolLabel = "exec_command"
+                    case "apply_patch_approval_request": toolLabel = "apply_patch"
+                    case "elicitation_request": toolLabel = (payload["server_name"] as? String).map { "mcp:\($0)" } ?? "elicitation"
+                    default: toolLabel = ptype
+                    }
+                    let cmdSummary: String
+                    if let cmdArr = payload["command"] as? [String], !cmdArr.isEmpty {
+                        cmdSummary = ClaudeCodeAdapter.firstSingleLine(cmdArr.joined(separator: " "), maxLength: 72)
+                    } else {
+                        cmdSummary = ClaudeCodeAdapter.summarizeToolInput(name: toolLabel, input: payload)
+                    }
+                    let reqAt = ts ?? lastActivityAt
+                    let pending = PendingApproval(
+                        requestID: "\(host.storageKey):codex:\(rawID):\(key)",
+                        sessionID: rawID,
+                        agentKind: kind,
+                        host: host,
+                        toolName: toolLabel,
+                        commandOrSummary: cmdSummary,
+                        cwd: cwd,
+                        requestedAt: reqAt,
+                        canRespondViaHook: false,
+                        highRiskMatchedRule: HookApprovalManager.matchedHighRiskRule(in: cmdSummary)
+                    )
+                    openApprovals[key] = OpenApprovalEntry(approval: pending, isEscalatedExec: ptype == "exec_approval_request")
+                    openApprovalOrder.removeAll { $0 == key }
+                    openApprovalOrder.append(key)
+                case "exec_command_begin", "exec_command_end", "patch_apply_begin", "patch_apply_end", "elicitation_abandoned":
+                    if let key = (payload["call_id"] as? String)
+                        ?? (payload["approval_id"] as? String)
+                        ?? (payload["elicitation_id"] as? String) {
+                        openApprovals.removeValue(forKey: key)
+                        openApprovalOrder.removeAll { $0 == key }
+                    }
+                case "item_completed":
+                    if let item = payload["item"] as? [String: Any],
+                       let itemID = item["id"] as? String, !itemID.isEmpty {
+                        openApprovals.removeValue(forKey: itemID)
+                        openApprovalOrder.removeAll { $0 == itemID }
+                    }
                 case "error", "turn_aborted":
                     turnOpen = false
                     openTools.removeAll()
                     openToolOrder.removeAll()
+                    openApprovals.removeAll()
+                    openApprovalOrder.removeAll()
                     if let message = payload["message"] as? String, !message.isEmpty {
                         errorBanner = ClaudeCodeAdapter.firstSingleLine(message, maxLength: 140)
                     }
@@ -894,15 +1039,56 @@ public enum CodexAdapter {
                     let name = (payload["name"] as? String) ?? "tool"
                     let args = payload["arguments"] ?? payload["input"]
                     let summary = ClaudeCodeAdapter.summarizeToolInput(name: name, input: args)
+                    let started = ts ?? lastActivityAt
                     let record = ToolCallRecord(
                         id: callID,
                         name: name,
                         summary: summary,
-                        startedAt: ts ?? lastActivityAt
+                        startedAt: started
                     )
                     openTools[callID] = record
                     openToolOrder.append(callID)
                     totalTools += 1
+
+                    let isUserQuestion = (name == "request_user_input" || name == "ask_user_question" || name == "AskUserQuestion")
+                    let isPermTool = (name == "request_permissions" || name.hasPrefix("request_plugin_install_"))
+                        && approvalPolicyMode != "never"
+                        && granularRequestPermissions != false
+
+                    var isEscalatedSandboxExec = false
+                    if (name == "exec_command" || name == "shell_command" || name == "shell" || name == "local_shell"),
+                       approvalsReviewer != "auto_review",
+                       approvalPolicyMode != "never",
+                       granularSandboxApproval != false {
+                        if approvalPolicyMode == "untrusted" || approvalPolicyMode == "unless-trusted" {
+                            isEscalatedSandboxExec = true
+                        } else if let argStr = args as? String,
+                                  (argStr.contains("require_escalated") || argStr.contains("with_additional_permissions")) {
+                            isEscalatedSandboxExec = true
+                        } else if let argDict = args as? [String: Any],
+                                  let sp = argDict["sandbox_permissions"] as? String,
+                                  (sp == "require_escalated" || sp == "with_additional_permissions") {
+                            isEscalatedSandboxExec = true
+                        }
+                    }
+
+                    if isUserQuestion || isPermTool || isEscalatedSandboxExec {
+                        let pending = PendingApproval(
+                            requestID: "\(host.storageKey):codex:\(rawID):\(callID)",
+                            sessionID: rawID,
+                            agentKind: kind,
+                            host: host,
+                            toolName: name,
+                            commandOrSummary: summary,
+                            cwd: cwd,
+                            requestedAt: started,
+                            canRespondViaHook: false,
+                            highRiskMatchedRule: HookApprovalManager.matchedHighRiskRule(in: summary)
+                        )
+                        openApprovals[callID] = OpenApprovalEntry(approval: pending, isEscalatedExec: isEscalatedSandboxExec)
+                        openApprovalOrder.removeAll { $0 == callID }
+                        openApprovalOrder.append(callID)
+                    }
                 case "function_call_output", "custom_tool_call_output":
                     markInTurnActivity()
                     let callID = (payload["call_id"] as? String) ?? ""
@@ -916,6 +1102,10 @@ public enum CodexAdapter {
                         record.finishedAt = ts ?? lastActivityAt
                         record.isError = isErr
                         completedTools.append(record)
+                    }
+                    if !callID.isEmpty {
+                        openApprovals.removeValue(forKey: callID)
+                        openApprovalOrder.removeAll { $0 == callID }
                     }
                 case "message":
                     let role = (payload["role"] as? String) ?? ""
@@ -1019,6 +1209,7 @@ public enum CodexAdapter {
         )
         baseSession.longInputUsages = longInputUsages.isEmpty ? nil : longInputUsages
         baseSession.todayLongInputUsages = todayLongInputUsages.isEmpty ? nil : todayLongInputUsages
+        let latestOpenApproval = openApprovalOrder.last.flatMap { openApprovals[$0] }
         return ParsedRolloutCore(
             baseSession: baseSession,
             fallbackTitle: fallbackTitle,
@@ -1026,7 +1217,9 @@ public enum CodexAdapter {
             hasAssistantMessage: lastAssistantMessage != nil,
             isArchivedFile: isArchivedFile,
             isSubagent: isSubagent,
-            parentThreadID: parentThreadID
+            parentThreadID: parentThreadID,
+            passiveApproval: latestOpenApproval?.approval,
+            passiveApprovalIsEscalatedExec: latestOpenApproval?.isEscalatedExec ?? false
         )
     }
 

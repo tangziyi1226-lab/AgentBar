@@ -147,19 +147,55 @@ struct SessionRowView: View {
                 .controlSize(.small)
                 .buttonStyle(.glass)
 
-                Button("在终端处理") {
+                Button(nativeApprovalHandleTitle) {
                     model.requestHandleInTerminal(session)
                 }
                 .controlSize(.small)
                 .buttonStyle(.glass)
             } else {
-                Button("跳转到终端审批") {
+                Button(passiveApprovalJumpTitle) {
                     JumpService.jump(to: session)
                 }
                 .controlSize(.small)
                 .buttonStyle(.glassProminent)
             }
         }
+    }
+
+    private var nativeApprovalTargetName: String {
+        if !session.host.isLocal {
+            return "终端"
+        }
+        switch session.launchEnvironment {
+        case .codexApp:
+            return "Codex"
+        case .vscodeExtension:
+            return "VS Code"
+        case .cursorExtension:
+            return "Cursor"
+        case .deepseekHarnessApp:
+            return "DeepSeek Harness"
+        default:
+            break
+        }
+        if session.kind.isCLI {
+            return "终端"
+        }
+        return session.kind.displayName
+    }
+
+    private var nativeApprovalHandleTitle: String {
+        "在 \(nativeApprovalTargetName) 处理"
+    }
+
+    private var passiveApprovalJumpTitle: String {
+        let isQuestion = session.pendingApproval.map {
+            $0.toolName == "request_user_input"
+                || $0.toolName == "ask_user_question"
+                || $0.toolName == "AskUserQuestion"
+        } ?? false
+        let actionWord = isQuestion ? "回答" : "审批"
+        return "跳转到 \(nativeApprovalTargetName) \(actionWord)"
     }
 
     @ViewBuilder

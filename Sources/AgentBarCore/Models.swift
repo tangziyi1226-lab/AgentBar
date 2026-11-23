@@ -350,6 +350,7 @@ public struct ProcessStats: Codable, Hashable, Sendable {
 public struct PendingApproval: Codable, Hashable, Sendable {
     public var requestID: String
     public var sessionID: String?
+    public var agentKind: AgentKind?
     public var host: HostID
     public var toolName: String
     public var commandOrSummary: String
@@ -361,6 +362,7 @@ public struct PendingApproval: Codable, Hashable, Sendable {
     public init(
         requestID: String,
         sessionID: String? = nil,
+        agentKind: AgentKind? = nil,
         host: HostID = .local,
         toolName: String,
         commandOrSummary: String,
@@ -371,6 +373,7 @@ public struct PendingApproval: Codable, Hashable, Sendable {
     ) {
         self.requestID = requestID
         self.sessionID = sessionID
+        self.agentKind = agentKind
         self.host = host
         self.toolName = toolName
         self.commandOrSummary = commandOrSummary
@@ -916,7 +919,9 @@ public enum SessionDeduplicator {
         if out.lastOutputMarkdown == nil { out.lastOutputMarkdown = older.lastOutputMarkdown }
         if out.outputTokensPerSecond == nil { out.outputTokensPerSecond = older.outputTokensPerSecond }
         if out.process == nil { out.process = older.process }
-        if out.pendingApproval == nil { out.pendingApproval = older.pendingApproval }
+        if out.status == .awaitingApproval, out.pendingApproval == nil {
+            out.pendingApproval = older.pendingApproval
+        }
 
         let newerShards: Set<String> = {
             if let set = newer.mergedShardPaths, !set.isEmpty { return set }
