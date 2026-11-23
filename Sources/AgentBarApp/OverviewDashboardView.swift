@@ -183,7 +183,7 @@ struct OverviewDashboardView: View {
         return VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("今日消耗总览（净输入+输出 \(netIO)）")
+                    Text("今日会话日志（净输入+输出 \(netIO)）")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.secondary)
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -197,7 +197,7 @@ struct OverviewDashboardView: View {
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 2) {
-                    Text(String(format: "预估 $%.2f", stats.todayCostUSD))
+                    Text(String(format: "API 等值 $%.2f", stats.todayCostUSD))
                         .font(.system(size: 13.5, weight: .bold, design: .rounded))
                         .monospacedDigit()
                     Text("\(stats.todaySessionCount) 个活跃会话 · \(stats.todayTurnCount) 轮 · 缓存 \(hitText)")
@@ -245,7 +245,7 @@ struct OverviewDashboardView: View {
 
         return LazyVGrid(columns: [GridItem(.flexible(), spacing: 7), GridItem(.flexible(), spacing: 7)], spacing: 7) {
             kpiTile(
-                title: "窗口期累计 Token",
+                title: "近期活跃会话的历史总量",
                 value: FormattingHelpers.compactTokens(stats.allUsage.totalTokens),
                 subtitle: String(
                     format: "净 %@ · %d 会话 · $%.2f",
@@ -300,7 +300,7 @@ struct OverviewDashboardView: View {
 
     private func modelBreakdownSection(_ items: [ModelBreakdownItem]) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Label("按模型消耗排行", systemImage: "cube.transparent")
+            Label("模型排行 · 活跃会话历史总量", systemImage: "cube.transparent")
                 .font(.system(size: 12, weight: .bold))
 
             VStack(spacing: 5) {
@@ -329,7 +329,7 @@ struct OverviewDashboardView: View {
 
     private func projectBreakdownSection(_ items: [ProjectBreakdownItem]) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Label("热门工作目录 Top \(items.count)", systemImage: "folder.badge.gearshape")
+            Label("目录排行 · 活跃会话历史总量", systemImage: "folder.badge.gearshape")
                 .font(.system(size: 12, weight: .bold))
 
             VStack(spacing: 5) {

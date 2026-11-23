@@ -409,6 +409,100 @@ struct AgentBarHookMain {
         let tmpSubs = SubscriptionAndStatsService.detectLocalSubscriptions(homeDirectory: tmpHome.path, sessions: warmCodex)
         precondition(tmpSubs.first(where: { $0.id == "sub:codex" })?.quotas.first?.usedPercent == 12.5)
 
+        // Unit tests: PR #8 cross-file Claude fork deduplication (both cold & warm cache), Codex cache_write disambiguation,
+        // inherited fork snapshot with zeroed last_token_usage, and >272k Astra tiered pricing
+        let forkHome = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("agentbar-fork-test-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: forkHome) }
+        let forkProject = forkHome.appendingPathComponent(".claude/projects/project", isDirectory: true)
+        try! FileManager.default.createDirectory(at: forkProject, withIntermediateDirectories: true)
+        let forkToday = isoNow.string(from: now)
+        let forkYesterday = isoNow.string(from: dayCutoff.addingTimeInterval(-60))
+        let forkHistory = """
+        {"type":"user","uuid":"prompt1","entrypoint":"claude-desktop-3p","sessionId":"parent","timestamp":"\(forkYesterday)","message":{"content":"first"}}
+        {"type":"assistant","sessionId":"parent","timestamp":"\(forkToday)","message":{"id":"reply1","model":"model-a","usage":{"cache_read_input_tokens":100}}}
+        """
+        let forkChild = """
+        {"type":"user","uuid":"prompt2","entrypoint":"claude-desktop-3p","sessionId":"child","timestamp":"\(forkToday)","message":{"content":"next"}}
+        {"type":"assistant","sessionId":"child","timestamp":"\(forkToday)","message":{"id":"reply2","model":"model-b","usage":{"output_tokens":7}}}
+        """
+        try! Data(forkHistory.utf8).write(to: forkProject.appendingPathComponent("parent.jsonl"))
+        try! Data((forkHistory + "\n" + forkChild).utf8).write(to: forkProject.appendingPathComponent("child.jsonl"))
+        for pass in 0..<2 {
+            let forkRows = await ClaudeCodeAdapter.loadLocalSessions(homeDirectory: forkHome.path)
+            let forkRow = forkRows.first { $0.rawSessionID == "child" }!
+            precondition(forkRow.todayUsage == TokenUsage(output: 7), "Fork pass \(pass) failed todayUsage")
+            precondition(forkRow.todayModelUsages?["model-a"] == nil, "Fork pass \(pass) leaked parent model")
+            precondition(forkRow.kind == .claudeDesktop, "Fork pass \(pass) kind mismatch")
+            let forkStats = SubscriptionAndStatsService.buildAnalytics(sessions: forkRows)
+            precondition(forkStats.todayUsage.totalTokens == 107 && forkStats.allTurnCount == 2 && forkStats.todayTurnCount == 1)
+        }
+
+        for reported in [30_167, 54_503] {
+            let cwRow = CodexAdapter.parseRollout(
+                jsonl: """
+                {"type":"session_meta","payload":{"id":"example","cwd":"/tmp"}}
+                {"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":29052,"cached_input_tokens":4714,"cache_write_input_tokens":24336,"output_tokens":1115,"total_tokens":\(reported)}}}}
+                """,
+                filePath: nil,
+                fileModificationDate: now,
+                host: .local
+            )!
+            precondition(cwRow.usage.totalTokens == reported && cwRow.usage.cacheWrite == 24_336)
+        }
+
+        let zeroLastCutoff = ClaudeCodeAdapter.parseISODate("2026-11-21T00:00:00Z")!
+        let zeroLastSession = CodexAdapter.parseRollout(
+            jsonl: """
+            {"type":"session_meta","payload":{"id":"child","forked_from_id":"parent","cwd":"/tmp"}}
+            {"timestamp":"2026-11-20T09:00:00Z","type":"event_msg","payload":{"type":"task_started"}}
+            {"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":800,"cached_input_tokens":700,"output_tokens":300},"last_token_usage":{"input_tokens":0,"output_tokens":0,"total_tokens":13}}}}
+            {"timestamp":"2026-11-21T09:00:00Z","type":"event_msg","payload":{"type":"task_started"}}
+            {"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":820,"cached_input_tokens":712,"output_tokens":304}}}}
+            """,
+            filePath: nil,
+            fileModificationDate: zeroLastCutoff,
+            host: .local,
+            dayCutoff: zeroLastCutoff
+        )!
+        precondition(zeroLastSession.usage == TokenUsage(input: 8, output: 4, cacheRead: 12))
+        precondition(zeroLastSession.todayUsage == zeroLastSession.usage)
+        precondition(zeroLastSession.turnCount == 2 && zeroLastSession.todayTurnCount == 1)
+
+        let astraCatalog = #"{"openai":{"models":{"gpt-6.2-astra":{"cost":{"input":8,"output":40,"cache_read":0.4,"cache_write":10,"context_over_200k":{"input":999},"tiers":[{"tier":{"type":"context","size":272000},"input":16,"output":60,"cache_read":0.8,"cache_write":20}]}}}}}"#
+        let astraRules = PricingCatalogSyncService.parseModelsDevJSON(Data(astraCatalog.utf8))
+        let astraCutoff = ClaudeCodeAdapter.parseISODate("2026-11-22T00:00:00Z")!
+        func astraEvent(_ time: String, _ cumulative: [Int], _ last: [Int]?) -> String {
+            func usageJSON(_ counts: [Int]) -> String {
+                "{\"input_tokens\":\(counts[0]),\"cached_input_tokens\":\(counts[1]),\"output_tokens\":\(counts[2])}"
+            }
+            let detail = last.map { ",\"last_token_usage\":" + usageJSON($0) } ?? ""
+            return "{\"timestamp\":\"\(time)\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":\(usageJSON(cumulative))\(detail)}}}"
+        }
+        let astraLarge = astraEvent("2026-11-22T01:00:00Z", [564_824, 1_000, 208], [292_824, 0, 204])
+        let astraLines = [
+            #"{"type":"session_meta","payload":{"id":"thread","cwd":"/tmp"}}"#,
+            #"{"type":"turn_context","payload":{"model":"byr/gpt-6.2-astra"}}"#,
+            astraEvent("2026-11-21T23:59:00Z", [272_000, 1_000, 4], [272_000, 1_000, 4]),
+            astraLarge,
+            astraLarge,
+            astraEvent("2026-11-22T01:00:00Z", [869_085, 299_624, 503], [304_261, 298_624, 295]),
+            astraEvent("2026-11-22T01:00:00Z", [1_169_085, 299_624, 503], nil)
+        ]
+        let astraRow = CodexAdapter.parseRollout(
+            jsonl: astraLines.joined(separator: "\n"),
+            filePath: "/tmp/first",
+            fileModificationDate: astraCutoff,
+            host: .local,
+            dayCutoff: astraCutoff
+        )!
+        let expectedYesterday = (271_000 * 8.0 + 1_000 * 0.4 + 4 * 40.0) / 1e6
+        let expectedToday = 4.697424 + 0.3467912 + 2.4
+        precondition(abs(PricingCatalog.estimatedCostUSD(for: astraRow, rules: astraRules)! - (expectedYesterday + expectedToday)) < 0.000001)
+        precondition(abs(PricingCatalog.estimatedTodayCostUSD(for: astraRow, dayCutoff: astraCutoff, rules: astraRules)! - expectedToday) < 0.000001)
+        let freeAstra = ModelPriceRule(modelPrefix: "byr/gpt-6.2-astra", inputPerMillionUSD: 0, outputPerMillionUSD: 0, cacheReadPerMillionUSD: 0, cacheWritePerMillionUSD: 0, defaultContextWindow: 1_000_000)
+        precondition(PricingCatalog.estimatedTodayCostUSD(for: astraRow, rules: [freeAstra]) == 0)
+
         let scannedProcs = ProcessAndChatScanner.scanLocalAgentProcesses()
         precondition(scannedProcs.allSatisfy { $0.pid > 0 && !$0.command.isEmpty })
 

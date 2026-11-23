@@ -2305,6 +2305,7 @@
   },
   {
     "modelPrefix": "gpt-6.2-astra",
+    "over272k": {"input": 16, "output": 60, "cacheRead": 0.8, "cacheWrite": 20},
     "inputPerMillionUSD": 8.0,
     "outputPerMillionUSD": 40.0,
     "cacheReadPerMillionUSD": 0.4,

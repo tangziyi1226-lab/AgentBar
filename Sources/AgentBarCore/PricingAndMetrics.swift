@@ -1,5 +1,13 @@
 import Foundation
 
+public struct LongInputRates: Codable, Hashable, Sendable {
+    public static let threshold = 272_000
+    public let input: Double
+    public let output: Double
+    public let cacheRead: Double
+    public let cacheWrite: Double
+}
+
 public struct ModelPriceRule: Codable, Hashable, Identifiable, Sendable {
     public var id: String { modelPrefix }
     public var modelPrefix: String
@@ -8,6 +16,7 @@ public struct ModelPriceRule: Codable, Hashable, Identifiable, Sendable {
     public var cacheReadPerMillionUSD: Double
     public var cacheWritePerMillionUSD: Double
     public var defaultContextWindow: Int
+    public var over272k: LongInputRates?
 
     public init(
         modelPrefix: String,
@@ -55,6 +64,7 @@ public struct PricingSyncStatus: Sendable, Equatable {
 }
 
 struct PersistedPricingCatalogCache: Codable, Sendable {
+    var formatVersion: Int? = 2
     var source: String
     var etag: String?
     var lastSyncedAt: Date
@@ -101,10 +111,19 @@ final class PricingCatalogStore: @unchecked Sendable {
         bundledRules = Self.loadBundledRules()
         if let cache = Self.loadRemoteCache() {
             remoteRules = cache.rules
-            cachedETag = cache.etag
+            if cache.formatVersion != 2, cache.source == "models.dev",
+               let bundled = bundledRules.first(where: { $0.over272k != nil }),
+               let index = remoteRules.firstIndex(where: { $0.modelPrefix == bundled.modelPrefix }),
+               remoteRules[index].inputPerMillionUSD == bundled.inputPerMillionUSD,
+               remoteRules[index].outputPerMillionUSD == bundled.outputPerMillionUSD,
+               remoteRules[index].cacheReadPerMillionUSD == bundled.cacheReadPerMillionUSD,
+               remoteRules[index].cacheWritePerMillionUSD == bundled.cacheWritePerMillionUSD {
+                remoteRules[index].over272k = bundled.over272k
+            }
+            cachedETag = cache.formatVersion == 2 ? cache.etag : nil
             cachedSource = cache.source
             lastSyncedAt = cache.lastSyncedAt
-            lastCheckedAt = cache.lastCheckedAt
+            lastCheckedAt = cache.formatVersion == 2 ? cache.lastCheckedAt : nil
         } else if !bundledRules.isEmpty {
             cachedSource = "内置快照"
         }
@@ -161,7 +180,7 @@ final class PricingCatalogStore: @unchecked Sendable {
 
         // Priority among catalog layers: remote synced > bundled JSON snapshot > compiled defaults
         var mergedByCanonical: [String: ModelPriceRule] = [:]
-        for layer in [remoteRules, bundledRules, PricingCatalog.defaults] {
+        for layer in [remoteRules, bundledRules.filter { $0.over272k != nil }, bundledRules, PricingCatalog.defaults] {
             for rule in layer {
                 let key = PricingCatalog.canonicalModelKey(rule.modelPrefix)
                 guard !key.isEmpty else { continue }
@@ -655,6 +674,7 @@ public enum PricingCatalog {
         return computeScopedCost(
             totalUsage: session.usage,
             perModelUsages: session.modelUsages,
+            longInputs: session.longInputUsages,
             fallbackModel: qualifiedModelKey(model: session.model, provider: session.provider),
             provider: session.provider,
             rules: rules
@@ -676,6 +696,7 @@ public enum PricingCatalog {
         return computeScopedCost(
             totalUsage: today,
             perModelUsages: perModel,
+            longInputs: session.todayUsage != nil ? session.todayLongInputUsages : session.longInputUsages,
             fallbackModel: qualifiedModelKey(model: session.model, provider: session.provider),
             provider: session.provider,
             rules: rules
@@ -696,6 +717,7 @@ public enum PricingCatalog {
     private static func computeScopedCost(
         totalUsage: TokenUsage,
         perModelUsages: [String: TokenUsage]?,
+        longInputs: [String: TokenUsage]?,
         fallbackModel: String?,
         provider: String?,
         rules: [ModelPriceRule]?
@@ -710,6 +732,13 @@ public enum PricingCatalog {
             let lookupName = qualifiedModelKey(model: modelName, provider: provider)
             let matched = rule(for: lookupName, customRules: rules) ?? fallbackDefaultRule
             sumCost += costForRule(usage: modelUsage, rule: matched)
+            if let long = longInputs?[modelName], let tier = matched.over272k,
+               canonicalModelKey(modelName) == canonicalModelKey(matched.modelPrefix) {
+                let covered = modelUsage.subtractingClamped(modelUsage.subtractingClamped(long))
+                let tierCost = (Double(covered.input) * tier.input + Double(covered.output) * tier.output
+                    + Double(covered.cacheRead) * tier.cacheRead + Double(covered.cacheWrite) * tier.cacheWrite) / 1_000_000
+                sumCost += tierCost - costForRule(usage: covered, rule: matched)
+            }
             attributed = attributed.adding(modelUsage)
         }
         let remainder = totalUsage.subtractingClamped(attributed)
@@ -886,14 +915,26 @@ public enum PricingCatalogSyncService {
                 let canon = PricingCatalog.canonicalModelKey(bareID)
                 guard !canon.isEmpty, seenCanonical.insert(canon).inserted else { continue }
 
-                result.append(ModelPriceRule(
+                var rule = ModelPriceRule(
                     modelPrefix: bareID.lowercased(),
                     inputPerMillionUSD: input,
                     outputPerMillionUSD: output,
                     cacheReadPerMillionUSD: cacheRead,
                     cacheWritePerMillionUSD: cacheWrite,
                     defaultContextWindow: ctx
-                ))
+                )
+                if providerID == "openai", bareLower == "gpt-6.2-astra",
+                   let tiers = cost["tiers"] as? [[String: Any]] {
+                    rule.over272k = tiers.compactMap { item -> LongInputRates? in
+                        guard let tier = item["tier"] as? [String: Any], tier["type"] as? String == "context",
+                              tier["size"] as? Int == LongInputRates.threshold,
+                              let input = doubleValue(item["input"]), let output = doubleValue(item["output"]),
+                              let read = doubleValue(item["cache_read"]), let write = doubleValue(item["cache_write"]),
+                              [input, output, read, write].allSatisfy({ $0.isFinite && $0 >= 0 }) else { return nil }
+                        return LongInputRates(input: input, output: output, cacheRead: read, cacheWrite: write)
+                    }.first
+                }
+                result.append(rule)
             }
         }
         return result

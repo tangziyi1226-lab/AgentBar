@@ -1110,30 +1110,33 @@ struct PanelView: View {
     }
 
     private var footerBar: some View {
-        HStack {
-            Text(model.todaySummaryText)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .help(model.todaySummaryTooltip)
-
-            Spacer()
+        let summary = model.todaySummaryLines
+        return HStack(spacing: 10) {
+            ViewThatFits(in: .horizontal) {
+                Text("\(summary.usage) · \(summary.cost)").fixedSize()
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(summary.usage)
+                    Text(summary.cost)
+                }.fixedSize(horizontal: false, vertical: true)
+            }
+            .monospacedDigit()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(model.todaySummaryTooltip)
 
             Button("设置") {
                 onOpenSettings()
             }
             .buttonStyle(.plain)
-            .font(.system(size: 11))
-            .foregroundStyle(.secondary)
+            .fixedSize()
 
             Button("退出") {
                 NSApplication.shared.terminate(nil)
             }
             .buttonStyle(.plain)
-            .font(.system(size: 11))
-            .foregroundStyle(.secondary)
-            .padding(.leading, 8)
+            .fixedSize()
         }
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
         .padding(.horizontal, 15)
         .padding(.vertical, 9)
         .overlay(alignment: .top) {

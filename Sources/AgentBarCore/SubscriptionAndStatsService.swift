@@ -599,7 +599,7 @@ public enum SubscriptionAndStatsService {
             let sToday = s.effectiveTodayUsage(dayCutoff: dayCutoff, demoMode: demoMode)
             if demoMode || sToday.totalTokens > 0 || s.lastActivityAt >= dayCutoff {
                 todaySessionCount += 1
-                todayTurnCount += s.turnCount
+                todayTurnCount += demoMode ? s.turnCount : (s.todayTurnCount ?? (s.startedAt >= dayCutoff ? s.turnCount : 0))
                 todayCost += PricingCatalog.estimatedTodayCostUSD(for: s, dayCutoff: dayCutoff, demoMode: demoMode) ?? 0
                 todayUsage = todayUsage.adding(sToday)
             }
