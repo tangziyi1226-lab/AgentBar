@@ -88,14 +88,6 @@
     "defaultContextWindow": 128000
   },
   {
-    "modelPrefix": "au.anthropic.claude-opus-4-6-v1",
-    "inputPerMillionUSD": 5.5,
-    "outputPerMillionUSD": 27.5,
-    "cacheReadPerMillionUSD": 0.55,
-    "cacheWritePerMillionUSD": 6.875,
-    "defaultContextWindow": 1000000
-  },
-  {
     "modelPrefix": "mistral.ministral-3-3b-instruct",
     "inputPerMillionUSD": 0.1,
     "outputPerMillionUSD": 0.1,
@@ -112,30 +104,6 @@
     "defaultContextWindow": 128000
   },
   {
-    "modelPrefix": "au.anthropic.claude-sonnet-4-6",
-    "inputPerMillionUSD": 3.3,
-    "outputPerMillionUSD": 16.5,
-    "cacheReadPerMillionUSD": 0.33,
-    "cacheWritePerMillionUSD": 4.125,
-    "defaultContextWindow": 1000000
-  },
-  {
-    "modelPrefix": "au.anthropic.claude-sonnet-5-5",
-    "inputPerMillionUSD": 2.2,
-    "outputPerMillionUSD": 11.0,
-    "cacheReadPerMillionUSD": 0.11,
-    "cacheWritePerMillionUSD": 2.75,
-    "defaultContextWindow": 1000000
-  },
-  {
-    "modelPrefix": "jp.anthropic.claude-sonnet-4-6",
-    "inputPerMillionUSD": 3.3,
-    "outputPerMillionUSD": 16.5,
-    "cacheReadPerMillionUSD": 0.33,
-    "cacheWritePerMillionUSD": 4.125,
-    "defaultContextWindow": 1000000
-  },
-  {
     "modelPrefix": "mistral.voxtral-small-24b-2507",
     "inputPerMillionUSD": 0.1,
     "outputPerMillionUSD": 0.3,
@@ -150,14 +118,6 @@
     "cacheReadPerMillionUSD": 1.5,
     "cacheWritePerMillionUSD": 1.5,
     "defaultContextWindow": 262144
-  },
-  {
-    "modelPrefix": "au.anthropic.claude-haiku-5-5",
-    "inputPerMillionUSD": 0.11,
-    "outputPerMillionUSD": 0.55,
-    "cacheReadPerMillionUSD": 0.011,
-    "cacheWritePerMillionUSD": 0.1375,
-    "defaultContextWindow": 1000000
   },
   {
     "modelPrefix": "deep-research-preview-04-2026",
@@ -192,52 +152,12 @@
     "defaultContextWindow": 131072
   },
   {
-    "modelPrefix": "jp.anthropic.claude-haiku-5-5",
-    "inputPerMillionUSD": 0.11,
-    "outputPerMillionUSD": 0.55,
-    "cacheReadPerMillionUSD": 0.011,
-    "cacheWritePerMillionUSD": 0.1375,
-    "defaultContextWindow": 1000000
-  },
-  {
     "modelPrefix": "openai.gpt-oss-safeguard-120b",
     "inputPerMillionUSD": 0.15,
     "outputPerMillionUSD": 0.6,
     "cacheReadPerMillionUSD": 0.15,
     "cacheWritePerMillionUSD": 0.15,
     "defaultContextWindow": 128000
-  },
-  {
-    "modelPrefix": "au.anthropic.claude-opus-4-7",
-    "inputPerMillionUSD": 5.5,
-    "outputPerMillionUSD": 27.5,
-    "cacheReadPerMillionUSD": 0.55,
-    "cacheWritePerMillionUSD": 6.875,
-    "defaultContextWindow": 1000000
-  },
-  {
-    "modelPrefix": "au.anthropic.claude-opus-4-8",
-    "inputPerMillionUSD": 5.5,
-    "outputPerMillionUSD": 27.5,
-    "cacheReadPerMillionUSD": 0.55,
-    "cacheWritePerMillionUSD": 6.875,
-    "defaultContextWindow": 1000000
-  },
-  {
-    "modelPrefix": "au.anthropic.claude-opus-5-5",
-    "inputPerMillionUSD": 4.4,
-    "outputPerMillionUSD": 22.0,
-    "cacheReadPerMillionUSD": 0.22,
-    "cacheWritePerMillionUSD": 5.5,
-    "defaultContextWindow": 1000000
-  },
-  {
-    "modelPrefix": "au.anthropic.claude-sonnet-5",
-    "inputPerMillionUSD": 2.2,
-    "outputPerMillionUSD": 11.0,
-    "cacheReadPerMillionUSD": 0.22,
-    "cacheWritePerMillionUSD": 2.75,
-    "defaultContextWindow": 1000000
   },
   {
     "modelPrefix": "deepseek-v4-flash-vision-exp",
@@ -293,46 +213,6 @@
     "outputPerMillionUSD": 2.5,
     "cacheReadPerMillionUSD": 0.2,
     "cacheWritePerMillionUSD": 1.25,
-    "defaultContextWindow": 1000000
-  },
-  {
-    "modelPrefix": "in.anthropic.claude-sonnet-5",
-    "inputPerMillionUSD": 2.2,
-    "outputPerMillionUSD": 11.0,
-    "cacheReadPerMillionUSD": 0.22,
-    "cacheWritePerMillionUSD": 2.75,
-    "defaultContextWindow": 1000000
-  },
-  {
-    "modelPrefix": "jp.anthropic.claude-opus-4-7",
-    "inputPerMillionUSD": 5.5,
-    "outputPerMillionUSD": 27.5,
-    "cacheReadPerMillionUSD": 0.55,
-    "cacheWritePerMillionUSD": 6.875,
-    "defaultContextWindow": 1000000
-  },
-  {
-    "modelPrefix": "jp.anthropic.claude-opus-4-8",
-    "inputPerMillionUSD": 5.5,
-    "outputPerMillionUSD": 27.5,
-    "cacheReadPerMillionUSD": 0.55,
-    "cacheWritePerMillionUSD": 6.875,
-    "defaultContextWindow": 1000000
-  },
-  {
-    "modelPrefix": "jp.anthropic.claude-opus-5-5",
-    "inputPerMillionUSD": 4.4,
-    "outputPerMillionUSD": 22.0,
-    "cacheReadPerMillionUSD": 0.22,
-    "cacheWritePerMillionUSD": 5.5,
-    "defaultContextWindow": 1000000
-  },
-  {
-    "modelPrefix": "jp.anthropic.claude-sonnet-5",
-    "inputPerMillionUSD": 2.2,
-    "outputPerMillionUSD": 11.0,
-    "cacheReadPerMillionUSD": 0.22,
-    "cacheWritePerMillionUSD": 2.75,
     "defaultContextWindow": 1000000
   },
   {
@@ -424,30 +304,6 @@
     "defaultContextWindow": 1048576
   },
   {
-    "modelPrefix": "global.openai.gpt-5.6-terra",
-    "inputPerMillionUSD": 2.0,
-    "outputPerMillionUSD": 12.0,
-    "cacheReadPerMillionUSD": 0.2,
-    "cacheWritePerMillionUSD": 2.5,
-    "defaultContextWindow": 1050000
-  },
-  {
-    "modelPrefix": "global.openai.gpt-6.1-terra",
-    "inputPerMillionUSD": 1.0,
-    "outputPerMillionUSD": 5.0,
-    "cacheReadPerMillionUSD": 0.05,
-    "cacheWritePerMillionUSD": 1.25,
-    "defaultContextWindow": 1050000
-  },
-  {
-    "modelPrefix": "global.openai.gpt-6.2-astra",
-    "inputPerMillionUSD": 8.0,
-    "outputPerMillionUSD": 40.0,
-    "cacheReadPerMillionUSD": 0.4,
-    "cacheWritePerMillionUSD": 10.0,
-    "defaultContextWindow": 1050000
-  },
-  {
     "modelPrefix": "grok-4.1-fast-non-reasoning",
     "inputPerMillionUSD": 0.2,
     "outputPerMillionUSD": 0.5,
@@ -486,14 +342,6 @@
     "cacheReadPerMillionUSD": 0.5,
     "cacheWritePerMillionUSD": 0.5,
     "defaultContextWindow": 131072
-  },
-  {
-    "modelPrefix": "au.anthropic.claude-opus-5",
-    "inputPerMillionUSD": 5.5,
-    "outputPerMillionUSD": 27.5,
-    "cacheReadPerMillionUSD": 0.55,
-    "cacheWritePerMillionUSD": 6.875,
-    "defaultContextWindow": 1000000
   },
   {
     "modelPrefix": "claude-sonnet-4-5-20250929",
@@ -536,35 +384,11 @@
     "defaultContextWindow": 8192
   },
   {
-    "modelPrefix": "global.openai.gpt-5.6-luna",
-    "inputPerMillionUSD": 0.2,
-    "outputPerMillionUSD": 1.2,
-    "cacheReadPerMillionUSD": 0.02,
-    "cacheWritePerMillionUSD": 0.25,
-    "defaultContextWindow": 1050000
-  },
-  {
     "modelPrefix": "grok-4.20-multi-agent-0309",
     "inputPerMillionUSD": 1.25,
     "outputPerMillionUSD": 2.5,
     "cacheReadPerMillionUSD": 0.2,
     "cacheWritePerMillionUSD": 1.25,
-    "defaultContextWindow": 1000000
-  },
-  {
-    "modelPrefix": "in.anthropic.claude-opus-5",
-    "inputPerMillionUSD": 5.5,
-    "outputPerMillionUSD": 27.5,
-    "cacheReadPerMillionUSD": 0.55,
-    "cacheWritePerMillionUSD": 6.875,
-    "defaultContextWindow": 1000000
-  },
-  {
-    "modelPrefix": "jp.anthropic.claude-opus-5",
-    "inputPerMillionUSD": 5.5,
-    "outputPerMillionUSD": 27.5,
-    "cacheReadPerMillionUSD": 0.55,
-    "cacheWritePerMillionUSD": 6.875,
     "defaultContextWindow": 1000000
   },
   {
@@ -624,38 +448,6 @@
     "defaultContextWindow": 1048576
   },
   {
-    "modelPrefix": "global.openai.gpt-5.6-sol",
-    "inputPerMillionUSD": 4.0,
-    "outputPerMillionUSD": 20.0,
-    "cacheReadPerMillionUSD": 0.4,
-    "cacheWritePerMillionUSD": 5.0,
-    "defaultContextWindow": 1050000
-  },
-  {
-    "modelPrefix": "global.openai.gpt-6-astra",
-    "inputPerMillionUSD": 10.0,
-    "outputPerMillionUSD": 50.0,
-    "cacheReadPerMillionUSD": 1.0,
-    "cacheWritePerMillionUSD": 12.5,
-    "defaultContextWindow": 1050000
-  },
-  {
-    "modelPrefix": "global.openai.gpt-6.1-sol",
-    "inputPerMillionUSD": 2.0,
-    "outputPerMillionUSD": 10.0,
-    "cacheReadPerMillionUSD": 0.1,
-    "cacheWritePerMillionUSD": 2.5,
-    "defaultContextWindow": 1050000
-  },
-  {
-    "modelPrefix": "global.openai.gpt-6.2-sol",
-    "inputPerMillionUSD": 2.0,
-    "outputPerMillionUSD": 10.0,
-    "cacheReadPerMillionUSD": 0.1,
-    "cacheWritePerMillionUSD": 2.5,
-    "defaultContextWindow": 1050000
-  },
-  {
     "modelPrefix": "moonshot-kimi-k2-instruct",
     "inputPerMillionUSD": 0.574,
     "outputPerMillionUSD": 2.294,
@@ -712,14 +504,6 @@
     "defaultContextWindow": 1048576
   },
   {
-    "modelPrefix": "global.openai.gpt-6-luna",
-    "inputPerMillionUSD": 0.1,
-    "outputPerMillionUSD": 0.5,
-    "cacheReadPerMillionUSD": 0.01,
-    "cacheWritePerMillionUSD": 0.125,
-    "defaultContextWindow": 1050000
-  },
-  {
     "modelPrefix": "gpt-daybreak-blue-latest",
     "inputPerMillionUSD": 4.0,
     "outputPerMillionUSD": 20.0,
@@ -752,20 +536,20 @@
     "defaultContextWindow": 32768
   },
   {
+    "modelPrefix": "writer.palmyra-vision-7b",
+    "inputPerMillionUSD": 0.15,
+    "outputPerMillionUSD": 0.6,
+    "cacheReadPerMillionUSD": 0.15,
+    "cacheWritePerMillionUSD": 0.15,
+    "defaultContextWindow": 4096
+  },
+  {
     "modelPrefix": "gemma-4-26b-a4b-it-maas",
     "inputPerMillionUSD": 0.15,
     "outputPerMillionUSD": 0.6,
     "cacheReadPerMillionUSD": 0.015,
     "cacheWritePerMillionUSD": 0.15,
     "defaultContextWindow": 262144
-  },
-  {
-    "modelPrefix": "global.openai.gpt-6-sol",
-    "inputPerMillionUSD": 2.0,
-    "outputPerMillionUSD": 10.0,
-    "cacheReadPerMillionUSD": 0.2,
-    "cacheWritePerMillionUSD": 2.5,
-    "defaultContextWindow": 1050000
   },
   {
     "modelPrefix": "gpt-daybreak-red-latest",
@@ -790,14 +574,6 @@
     "cacheReadPerMillionUSD": 0.2,
     "cacheWritePerMillionUSD": 1.25,
     "defaultContextWindow": 2000000
-  },
-  {
-    "modelPrefix": "in.openai.gpt-5.6-terra",
-    "inputPerMillionUSD": 2.2,
-    "outputPerMillionUSD": 13.2,
-    "cacheReadPerMillionUSD": 0.22,
-    "cacheWritePerMillionUSD": 2.75,
-    "defaultContextWindow": 1050000
   },
   {
     "modelPrefix": "kimi-k3.1-pro-highspeed",
@@ -854,30 +630,6 @@
     "cacheReadPerMillionUSD": 0.22,
     "cacheWritePerMillionUSD": 5.5,
     "defaultContextWindow": 1048576
-  },
-  {
-    "modelPrefix": "us.openai.gpt-5.6-terra",
-    "inputPerMillionUSD": 2.2,
-    "outputPerMillionUSD": 13.2,
-    "cacheReadPerMillionUSD": 0.22,
-    "cacheWritePerMillionUSD": 2.75,
-    "defaultContextWindow": 1050000
-  },
-  {
-    "modelPrefix": "us.openai.gpt-6.1-terra",
-    "inputPerMillionUSD": 1.1,
-    "outputPerMillionUSD": 5.5,
-    "cacheReadPerMillionUSD": 0.055,
-    "cacheWritePerMillionUSD": 1.375,
-    "defaultContextWindow": 1050000
-  },
-  {
-    "modelPrefix": "us.openai.gpt-6.2-astra",
-    "inputPerMillionUSD": 8.8,
-    "outputPerMillionUSD": 44.0,
-    "cacheReadPerMillionUSD": 0.44,
-    "cacheWritePerMillionUSD": 11.0,
-    "defaultContextWindow": 1050000
   },
   {
     "modelPrefix": "command-a-plus-05-2026",
@@ -968,14 +720,6 @@
     "defaultContextWindow": 262144
   },
   {
-    "modelPrefix": "in.openai.gpt-5.6-luna",
-    "inputPerMillionUSD": 0.22,
-    "outputPerMillionUSD": 1.32,
-    "cacheReadPerMillionUSD": 0.022,
-    "cacheWritePerMillionUSD": 0.275,
-    "defaultContextWindow": 1050000
-  },
-  {
     "modelPrefix": "minimax-m2.5-highspeed",
     "inputPerMillionUSD": 0.6,
     "outputPerMillionUSD": 2.4,
@@ -1022,14 +766,6 @@
     "cacheReadPerMillionUSD": 0.1,
     "cacheWritePerMillionUSD": 0.1,
     "defaultContextWindow": 8192
-  },
-  {
-    "modelPrefix": "us.openai.gpt-5.6-luna",
-    "inputPerMillionUSD": 0.22,
-    "outputPerMillionUSD": 1.32,
-    "cacheReadPerMillionUSD": 0.022,
-    "cacheWritePerMillionUSD": 0.275,
-    "defaultContextWindow": 1050000
   },
   {
     "modelPrefix": "gemini-2.5-flash-lite",
@@ -1102,38 +838,6 @@
     "cacheReadPerMillionUSD": 0.33,
     "cacheWritePerMillionUSD": 4.125,
     "defaultContextWindow": 1048576
-  },
-  {
-    "modelPrefix": "us.openai.gpt-5.6-sol",
-    "inputPerMillionUSD": 4.4,
-    "outputPerMillionUSD": 22.0,
-    "cacheReadPerMillionUSD": 0.44,
-    "cacheWritePerMillionUSD": 5.5,
-    "defaultContextWindow": 1050000
-  },
-  {
-    "modelPrefix": "us.openai.gpt-6-astra",
-    "inputPerMillionUSD": 11.0,
-    "outputPerMillionUSD": 55.0,
-    "cacheReadPerMillionUSD": 1.1,
-    "cacheWritePerMillionUSD": 13.75,
-    "defaultContextWindow": 1050000
-  },
-  {
-    "modelPrefix": "us.openai.gpt-6.1-sol",
-    "inputPerMillionUSD": 2.2,
-    "outputPerMillionUSD": 11.0,
-    "cacheReadPerMillionUSD": 0.11,
-    "cacheWritePerMillionUSD": 2.75,
-    "defaultContextWindow": 1050000
-  },
-  {
-    "modelPrefix": "us.openai.gpt-6.2-sol",
-    "inputPerMillionUSD": 2.2,
-    "outputPerMillionUSD": 11.0,
-    "cacheReadPerMillionUSD": 0.11,
-    "cacheWritePerMillionUSD": 2.75,
-    "defaultContextWindow": 1050000
   },
   {
     "modelPrefix": "c4ai-aya-expanse-32b",
@@ -1253,14 +957,6 @@
     "outputPerMillionUSD": 44.0,
     "cacheReadPerMillionUSD": 0.44,
     "cacheWritePerMillionUSD": 11.0,
-    "defaultContextWindow": 1050000
-  },
-  {
-    "modelPrefix": "us.openai.gpt-6-luna",
-    "inputPerMillionUSD": 0.11,
-    "outputPerMillionUSD": 0.55,
-    "cacheReadPerMillionUSD": 0.011,
-    "cacheWritePerMillionUSD": 0.1375,
     "defaultContextWindow": 1050000
   },
   {
@@ -1422,14 +1118,6 @@
     "cacheReadPerMillionUSD": 0.02092,
     "cacheWritePerMillionUSD": 0.10461,
     "defaultContextWindow": 256000
-  },
-  {
-    "modelPrefix": "us.openai.gpt-6-sol",
-    "inputPerMillionUSD": 2.2,
-    "outputPerMillionUSD": 11.0,
-    "cacheReadPerMillionUSD": 0.22,
-    "cacheWritePerMillionUSD": 2.75,
-    "defaultContextWindow": 1050000
   },
   {
     "modelPrefix": "anthropic.claude-opus-4-6-v1",
@@ -2305,12 +1993,17 @@
   },
   {
     "modelPrefix": "gpt-6.2-astra",
-    "over272k": {"input": 16, "output": 60, "cacheRead": 0.8, "cacheWrite": 20},
     "inputPerMillionUSD": 8.0,
     "outputPerMillionUSD": 40.0,
     "cacheReadPerMillionUSD": 0.4,
     "cacheWritePerMillionUSD": 10.0,
-    "defaultContextWindow": 1050000
+    "defaultContextWindow": 1050000,
+    "over272k": {
+      "input": 16.0,
+      "output": 60.0,
+      "cacheRead": 0.8,
+      "cacheWrite": 20.0
+    }
   },
   {
     "modelPrefix": "gpt-image-1.5",
